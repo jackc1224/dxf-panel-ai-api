@@ -1,0 +1,2 @@
+本資料夾可直接用 Zeabur Local Project 上傳部署。
+環境變數: MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET
