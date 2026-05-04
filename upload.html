@@ -665,41 +665,49 @@
       return data;
     }
 
-    async function runDifyWorkflow(objectKey) {
-      const formData = new FormData();
+async function runDifyWorkflow(objectKey) {
+  const formData = new FormData();
 
-      formData.append("object_key", objectKey);
-      formData.append("product_name", getValue("productName"));
-      formData.append("single_board_length", getValue("singleBoardLength"));
-      formData.append("single_board_width", getValue("singleBoardWidth"));
-      formData.append("rail_width", getValue("railWidth"));
-      formData.append("smt_max_length", getValue("smtMaxLength"));
-      formData.append("smt_max_width", getValue("smtMaxWidth"));
-      formData.append("ict_max_length", getValue("ictMaxLength"));
-      formData.append("ict_max_width", getValue("ictMaxWidth"));
-      formData.append("has_bga_qfn", getValue("hasBgaQfn"));
-      formData.append("has_dip", getValue("hasDip"));
-      formData.append("has_heavy_component", getValue("hasHeavyComponent"));
-      formData.append("is_irregular_shape", getValue("isIrregularShape"));
+  formData.append("object_key", objectKey);
+  formData.append("product_name", getValue("productName"));
+  formData.append("single_board_length", getValue("singleBoardLength"));
+  formData.append("single_board_width", getValue("singleBoardWidth"));
+  formData.append("rail_width", getValue("railWidth"));
+  formData.append("smt_max_length", getValue("smtMaxLength"));
+  formData.append("smt_max_width", getValue("smtMaxWidth"));
+  formData.append("ict_max_length", getValue("ictMaxLength"));
+  formData.append("ict_max_width", getValue("ictMaxWidth"));
+  formData.append("has_bga_qfn", getValue("hasBgaQfn"));
+  formData.append("has_dip", getValue("hasDip"));
+  formData.append("has_heavy_component", getValue("hasHeavyComponent"));
+  formData.append("is_irregular_shape", getValue("isIrregularShape"));
 
-      const response = await fetch("/api/pcb/run-dify-panelization", {
-        method: "POST",
-        body: formData
-      });
+  const response = await fetch("/api/pcb/run-dify-panelization", {
+    method: "POST",
+    body: formData
+  });
 
-      let data;
-      try {
-        data = await response.json();
-      } catch {
-        throw new Error("Dify API 回傳格式不是 JSON。");
-      }
+  const rawText = await response.text();
 
-      if (!response.ok) {
-        throw new Error(JSON.stringify(data, null, 2));
-      }
+  let data = null;
 
-      return data;
-    }
+  try {
+    data = JSON.parse(rawText);
+  } catch (e) {
+    throw new Error(
+      "後端 /api/pcb/run-dify-panelization 回傳不是 JSON。\n\n" +
+      "HTTP Status: " + response.status + "\n\n" +
+      "Raw Response 前 1500 字：\n" +
+      rawText.substring(0, 1500)
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(JSON.stringify(data, null, 2));
+  }
+
+  return data;
+}
 
     function renderDifyResult(difyResult) {
       document.getElementById("rawResult").innerText = JSON.stringify(difyResult, null, 2);
