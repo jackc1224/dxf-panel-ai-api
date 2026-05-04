@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PCB DXF 上傳工具</title>
+  <style>
+    body {
+      font-family: Arial, "Microsoft JhengHei", sans-serif;
+      background: #f4f6f8;
+      margin: 0;
+      padding: 0;
+      color: #222;
+    }
+
+    .container {
+      max-width: 760px;
+      margin: 60px auto;
+      background: #fff;
+      padding: 36px;
+      border-radius: 16px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+    }
+
+    h1 {
+      margin-top: 0;
+      color: #1f2937;
+      font-size: 28px;
+    }
+
+    .desc {
+      color: #555;
+      line-height: 1.7;
+      margin-bottom: 28px;
+    }
+
+    .upload-box {
+      border: 2px dashed #9ca3af;
+      border-radius: 14px;
+      padding: 32px;
+      text-align: center;
+      background: #fafafa;
+      margin-bottom: 24px;
+    }
+
+    input[type="file"] {
+      margin: 16px 0;
+      font-size: 16px;
+    }
+
+    button {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 10px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
+
+    .result {
+      display: none;
+      margin-top: 24px;
+      padding: 20px;
+      border-radius: 12px;
+      background: #ecfdf5;
+      border: 1px solid #10b981;
+    }
+
+    .error {
+      display: none;
+      margin-top: 24px;
+      padding: 20px;
+      border-radius: 12px;
+      background: #fef2f2;
+      border: 1px solid #ef4444;
+      color: #991b1b;
+    }
+
+    .field {
+      margin: 14px 0;
+    }
+
+    .label {
+      font-weight: bold;
+      margin-bottom: 6px;
+    }
+
+    .copy-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input.copy-input {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }
+
+    .note {
+      margin-top: 20px;
+      color: #666;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .small-btn {
+      padding: 10px 14px;
+      font-size: 14px;
+      background: #059669;
+    }
+
+    .status {
+      margin-top: 14px;
+      color: #374151;
+      font-size: 14px;
+    }
+
+    code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>PCB DXF 上傳工具</h1>
+
+    <div class="desc">
+      請先在此上傳 PCB 單板 DXF 檔。<br />
+      上傳成功後，系統會產生一組 <code>object_key</code>。<br />
+      請把 <code>object_key</code> 複製到 Dify 的 PCB 連版規劃 GenAI 表單中使用。
+    </div>
+
+    <div class="upload-box">
+      <div>請選擇 .dxf 檔案</div>
+      <input id="fileInput" type="file" accept=".dxf" />
+      <br />
+      <button id="uploadBtn" onclick="uploadFile()">上傳 DXF</button>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div id="resultBox" class="result">
+      <h2>上傳成功</h2>
+
+      <div class="field">
+        <div class="label">檔案名稱</div>
+        <div id="filename"></div>
+      </div>
+
+      <div class="field">
+        <div class="label">檔案大小</div>
+        <div id="filesize"></div>
+      </div>
+
+      <div class="field">
+        <div class="label">object_key，請複製到 Dify</div>
+        <div class="copy-row">
+          <input id="objectKeyInput" class="copy-input" readonly />
+          <button class="small-btn" onclick="copyObjectKey()">複製</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="label">file_id</div>
+        <div id="fileId"></div>
+      </div>
+
+      <div class="note">
+        下一步：打開 Dify 的 PCB DXF 連版規劃 GenAI，將上方 object_key 貼到 <code>object_key</code> 欄位。
+      </div>
+    </div>
+
+    <div id="errorBox" class="error"></div>
+  </div>
+
+  <script>
+    async function uploadFile() {
+      const fileInput = document.getElementById("fileInput");
+      const uploadBtn = document.getElementById("uploadBtn");
+      const status = document.getElementById("status");
+      const resultBox = document.getElementById("resultBox");
+      const errorBox = document.getElementById("errorBox");
+
+      resultBox.style.display = "none";
+      errorBox.style.display = "none";
+      errorBox.innerText = "";
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        errorBox.style.display = "block";
+        errorBox.innerText = "請先選擇 DXF 檔案。";
+        return;
+      }
+
+      const file = fileInput.files[0];
+
+      if (!file.name.toLowerCase().endsWith(".dxf")) {
+        errorBox.style.display = "block";
+        errorBox.innerText = "只允許上傳 .dxf 檔案。";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("dxf_file", file);
+
+      uploadBtn.disabled = true;
+      status.innerText = "上傳中，請稍候...";
+
+      try {
+        const response = await fetch("/api/pcb/upload-dxf-to-minio", {
+          method: "POST",
+          body: formData
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "上傳失敗");
+        }
+
+        document.getElementById("filename").innerText = data.filename || "";
+        document.getElementById("filesize").innerText = formatBytes(data.file_size_bytes || 0);
+        document.getElementById("objectKeyInput").value = data.object_key || "";
+        document.getElementById("fileId").innerText = data.file_id || "";
+
+        resultBox.style.display = "block";
+        status.innerText = "上傳完成。";
+      } catch (error) {
+        errorBox.style.display = "block";
+        errorBox.innerText = "上傳失敗：" + error.message;
+        status.innerText = "";
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    }
+
+    function copyObjectKey() {
+      const input = document.getElementById("objectKeyInput");
+      input.select();
+      input.setSelectionRange(0, 99999);
+      navigator.clipboard.writeText(input.value);
+      alert("object_key 已複製。");
+    }
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return "0 Bytes";
+      const k = 1024;
+      const sizes = ["Bytes", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+    }
+  </script>
+</body>
+</html>
