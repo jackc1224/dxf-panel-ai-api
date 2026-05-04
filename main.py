@@ -758,7 +758,16 @@ def download_from_minio(
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
+def normalize_yes_no(value: str) -> str:
+    v = str(value).strip().lower()
 
+    if v in ["yes", "true", "1", "是", "y"]:
+        return "Yes"
+
+    if v in ["no", "false", "0", "否", "n"]:
+        return "No"
+
+    return "No"    
 async def run_dify_panelization(
     object_key: str = Form(...),
     product_name: str = Form(...),
