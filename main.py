@@ -13,7 +13,7 @@ from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.6.0-minio-dify-fixed")
+app = FastAPI(title="PCB Panelization API", version="0.7.0-minio-dify-debug")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +70,13 @@ def safe_filename_name(filename: str) -> str:
         .replace("\\", "_")
         .replace(" ", "_")
     )
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 # =========================================================
@@ -174,7 +181,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.6.0-minio-dify-fixed",
+        "version": "0.7.0-minio-dify-debug",
         "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
 
@@ -226,7 +233,8 @@ def health_dify():
         "status": "ok" if DIFY_API_BASE and DIFY_API_KEY else "error",
         "DIFY_API_BASE_configured": bool(DIFY_API_BASE),
         "DIFY_API_KEY_configured": bool(DIFY_API_KEY),
-        "DIFY_API_BASE": DIFY_API_BASE
+        "DIFY_API_BASE": DIFY_API_BASE,
+        "expected_workflow_run_url": f"{DIFY_API_BASE.rstrip('/')}/workflows/run" if DIFY_API_BASE else ""
     }
 
 
@@ -800,7 +808,6 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
-    # 注意：
     # Dify Start 表單若是 text-input，API inputs 必須傳 string。
     # Dify Select 欄位只接受 Yes / No，所以用 normalize_yes_no() 轉換。
     payload = {
@@ -842,8 +849,24 @@ async def run_dify_panelization(
                 detail={
                     "message": "Dify workflow API failed",
                     "dify_status_code": response.status_code,
+                    "dify_url": url,
                     "sent_payload": payload,
                     "dify_response": response.text
+                }
+            )
+
+        content_type = response.headers.get("content-type", "")
+
+        if "application/json" not in content_type:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Dify API returned non-JSON response",
+                    "dify_status_code": response.status_code,
+                    "content_type": content_type,
+                    "dify_url": url,
+                    "sent_payload": payload,
+                    "dify_response_preview": response.text[:1000]
                 }
             )
 
