@@ -621,7 +621,14 @@
 
         status.innerText = "步驟 2/3：已取得 object_key，正在呼叫 Dify Workflow 進行 AI 連版規劃...";
 
-        const difyResult = await runDifyWorkflow(uploadData.object_key);
+        status.innerText = "DXF 上傳完成，請複製 object_key 到 Dify 執行連版規劃。";
+
+resultBox.style.display = "block";
+
+document.getElementById("reportText").innerText =
+  "DXF 已成功上傳至 MinIO。\n\n" +
+  "請複製上方 object_key，貼到 Dify 的 object_key 欄位後執行 Workflow。\n\n" +
+  "object_key：\n" + uploadData.object_key;
 
         status.innerText = "步驟 3/3：正在整理 AI 報告與 DXF 下載連結...";
 
