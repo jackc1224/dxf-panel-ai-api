@@ -3,221 +3,585 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PCB DXF 上傳工具</title>
+  <title>PCB DXF 連版規劃 GenAI</title>
+
   <style>
-<style>
-  .form-card {
-    margin-top: 28px;
-    padding: 28px;
-    border-radius: 18px;
-    background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
-    border: 1px solid #e5e7eb;
-    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
-  }
+    body {
+      font-family: Arial, "Microsoft JhengHei", sans-serif;
+      background: #f4f6f8;
+      margin: 0;
+      padding: 0;
+      color: #222;
+    }
 
-  .form-title {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 6px;
-    font-size: 24px;
-    font-weight: 700;
-    color: #111827;
-  }
+    .container {
+      max-width: 920px;
+      margin: 48px auto;
+      background: #ffffff;
+      padding: 36px;
+      border-radius: 20px;
+      box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+    }
 
-  .form-title-badge {
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: #dbeafe;
-    color: #1d4ed8;
-    font-size: 13px;
-    font-weight: 600;
-  }
+    .page-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+      color: #111827;
+      font-size: 30px;
+      font-weight: 800;
+    }
 
-  .form-subtitle {
-    margin-bottom: 24px;
-    color: #6b7280;
-    font-size: 14px;
-    line-height: 1.6;
-  }
+    .logo-badge {
+      width: 42px;
+      height: 42px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: white;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+    }
 
-  .section-block {
-    margin-top: 22px;
-  }
+    .desc {
+      color: #555;
+      line-height: 1.7;
+      margin-bottom: 28px;
+      font-size: 15px;
+    }
 
-  .section-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 14px;
-    color: #374151;
-    font-weight: 700;
-    font-size: 16px;
-  }
+    .upload-box {
+      border: 2px dashed #9ca3af;
+      border-radius: 18px;
+      padding: 30px;
+      text-align: center;
+      background: #fafafa;
+      margin-bottom: 26px;
+    }
 
-  .section-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: #2563eb;
-  }
+    .upload-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 8px;
+    }
 
-  .form-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 18px 20px;
-  }
+    .upload-hint {
+      color: #6b7280;
+      font-size: 14px;
+      margin-bottom: 16px;
+      line-height: 1.6;
+    }
 
-  .form-field {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-  }
+    input[type="file"] {
+      margin: 16px 0;
+      font-size: 16px;
+    }
 
-  .form-field label {
-    font-size: 14px;
-    font-weight: 600;
-    color: #374151;
-  }
+    button {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 12px;
+      font-size: 16px;
+      cursor: pointer;
+      font-weight: 700;
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
 
-  .form-field input,
-  .form-field select {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 12px 13px;
-    border-radius: 12px;
-    border: 1px solid #d1d5db;
-    background: #ffffff;
-    color: #111827;
-    font-size: 15px;
-    outline: none;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
-  }
+    button:hover {
+      background: #1d4ed8;
+    }
 
-  .form-field input:focus,
-  .form-field select:focus {
-    border-color: #2563eb;
-    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
-    background: #fff;
-  }
+    button:active {
+      transform: translateY(1px);
+    }
 
-  .form-hint {
-    color: #9ca3af;
-    font-size: 12px;
-  }
+    button:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
 
-  .full-width {
-    grid-column: 1 / -1;
-  }
+    .secondary-btn {
+      background: #059669;
+    }
 
-  .process-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 14px;
-  }
+    .secondary-btn:hover {
+      background: #047857;
+    }
 
-  .process-card {
-    padding: 14px;
-    border: 1px solid #e5e7eb;
-    border-radius: 14px;
-    background: #ffffff;
-  }
-
-  .process-card label {
-    display: block;
-    margin-bottom: 8px;
-    font-size: 14px;
-    font-weight: 700;
-    color: #374151;
-  }
-
-  .process-card select {
-    width: 100%;
-    padding: 10px 12px;
-    border-radius: 10px;
-    border: 1px solid #d1d5db;
-    background: #f9fafb;
-    font-size: 14px;
-  }
-
-  .form-note {
-    margin-top: 22px;
-    padding: 14px 16px;
-    border-radius: 14px;
-    background: #eff6ff;
-    color: #1e40af;
-    font-size: 14px;
-    line-height: 1.7;
-    border: 1px solid #bfdbfe;
-  }
-
-  @media (max-width: 720px) {
-    .form-grid,
-    .process-grid {
-      grid-template-columns: 1fr;
+    .small-btn {
+      padding: 10px 14px;
+      font-size: 14px;
+      background: #059669;
     }
 
     .form-card {
-      padding: 22px;
+      margin-top: 28px;
+      padding: 28px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
+      border: 1px solid #e5e7eb;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
     }
-  }
-</style>
+
+    .form-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+      font-size: 24px;
+      font-weight: 700;
+      color: #111827;
+    }
+
+    .form-title-badge {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #dbeafe;
+      color: #1d4ed8;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .form-subtitle {
+      margin-bottom: 24px;
+      color: #6b7280;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .section-block {
+      margin-top: 22px;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      color: #374151;
+      font-weight: 700;
+      font-size: 16px;
+    }
+
+    .section-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #2563eb;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px 20px;
+    }
+
+    .form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .form-field label {
+      font-size: 14px;
+      font-weight: 600;
+      color: #374151;
+    }
+
+    .form-field input,
+    .form-field select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 12px 13px;
+      border-radius: 12px;
+      border: 1px solid #d1d5db;
+      background: #ffffff;
+      color: #111827;
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+    }
+
+    .form-field input:focus,
+    .form-field select:focus {
+      border-color: #2563eb;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+      background: #fff;
+    }
+
+    .form-hint {
+      color: #9ca3af;
+      font-size: 12px;
+    }
+
+    .full-width {
+      grid-column: 1 / -1;
+    }
+
+    .process-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .process-card {
+      padding: 14px;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      background: #ffffff;
+    }
+
+    .process-card label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #374151;
+    }
+
+    .process-card select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      background: #f9fafb;
+      font-size: 14px;
+    }
+
+    .form-note {
+      margin-top: 22px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      background: #eff6ff;
+      color: #1e40af;
+      font-size: 14px;
+      line-height: 1.7;
+      border: 1px solid #bfdbfe;
+    }
+
+    .status {
+      margin-top: 16px;
+      color: #374151;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .result {
+      display: none;
+      margin-top: 26px;
+      padding: 24px;
+      border-radius: 16px;
+      background: #ecfdf5;
+      border: 1px solid #10b981;
+    }
+
+    .result h2 {
+      margin-top: 0;
+      color: #065f46;
+    }
+
+    .error {
+      display: none;
+      margin-top: 24px;
+      padding: 20px;
+      border-radius: 12px;
+      background: #fef2f2;
+      border: 1px solid #ef4444;
+      color: #991b1b;
+      white-space: pre-wrap;
+    }
+
+    .field {
+      margin: 14px 0;
+    }
+
+    .label {
+      font-weight: bold;
+      margin-bottom: 6px;
+      color: #374151;
+    }
+
+    .copy-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input.copy-input {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }
+
+    .download-link {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 12px 18px;
+      background: #2563eb;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 12px;
+      font-weight: 700;
+    }
+
+    .download-link:hover {
+      background: #1d4ed8;
+    }
+
+    .report-box {
+      margin-top: 20px;
+      padding: 20px;
+      border-radius: 14px;
+      background: #ffffff;
+      border: 1px solid #d1fae5;
+      color: #111827;
+      white-space: pre-wrap;
+      line-height: 1.7;
+      max-height: 520px;
+      overflow: auto;
+    }
+
+    .raw-box {
+      margin-top: 20px;
+      padding: 16px;
+      border-radius: 14px;
+      background: #111827;
+      color: #e5e7eb;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      max-height: 400px;
+      overflow: auto;
+      font-size: 13px;
+    }
+
+    code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    @media (max-width: 720px) {
+      .container {
+        margin: 24px 12px;
+        padding: 24px;
+      }
+
+      .form-grid,
+      .process-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .form-card {
+        padding: 22px;
+      }
+
+      .copy-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+    }
   </style>
 </head>
+
 <body>
   <div class="container">
-    <h1>PCB DXF 上傳工具</h1>
+    <div class="page-title">
+      <span class="logo-badge">AI</span>
+      PCB DXF 連版規劃 GenAI
+    </div>
 
     <div class="desc">
-      請先在此上傳 PCB 單板 DXF 檔。<br />
-      上傳成功後，系統會產生一組 <code>object_key</code>。<br />
-      請把 <code>object_key</code> 複製到 Dify 的 PCB 連版規劃 GenAI 表單中使用。
+      請先選擇 PCB 單板 DXF 檔，並填寫連版條件。<br />
+      系統會自動將 DXF 上傳至 MinIO，接著呼叫 Dify Workflow 產生 AI 建議報告與連版 DXF 下載連結。
     </div>
 
     <div class="upload-box">
-      <div>請選擇 .dxf 檔案</div>
+      <div class="upload-title">DXF 檔案上傳</div>
+      <div class="upload-hint">
+        支援 .dxf 檔。大檔案會先上傳至 MinIO，再由 Dify 使用 object_key 進行連版分析。
+      </div>
+
       <input id="fileInput" type="file" accept=".dxf" />
       <br />
-      <button id="uploadBtn" onclick="uploadFile()">上傳 DXF</button>
+
+      <button id="uploadBtn" onclick="uploadAndRun()">上傳 DXF 並執行 AI 連版規劃</button>
+
       <div id="status" class="status"></div>
     </div>
 
+    <div class="form-card">
+      <div class="form-title">
+        PCB 連版條件
+        <span class="form-title-badge">Panelization Input</span>
+      </div>
+
+      <div class="form-subtitle">
+        請輸入單板尺寸、設備限制與製程條件。系統會根據這些資料與公司連板規範，產生連版建議與輸出 DXF。
+      </div>
+
+      <div class="section-block">
+        <div class="section-header">
+          <span class="section-dot"></span>
+          產品與單板基本資料
+        </div>
+
+        <div class="form-grid">
+          <div class="form-field full-width">
+            <label for="productName">產品名稱</label>
+            <input id="productName" value="TEST-PCB-001" placeholder="例如：ABC-001" />
+            <div class="form-hint">此名稱會用於報告與輸出 DXF 檔名。</div>
+          </div>
+
+          <div class="form-field">
+            <label for="singleBoardLength">單板長度 mm</label>
+            <input id="singleBoardLength" type="number" value="120" min="1" step="0.1" />
+          </div>
+
+          <div class="form-field">
+            <label for="singleBoardWidth">單板寬度 mm</label>
+            <input id="singleBoardWidth" type="number" value="80" min="1" step="0.1" />
+          </div>
+
+          <div class="form-field">
+            <label for="railWidth">工藝邊 mm</label>
+            <input id="railWidth" type="number" value="5" min="0" step="0.1" />
+            <div class="form-hint">建議初始值 5 mm，正式值請依公司規範確認。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-block">
+        <div class="section-header">
+          <span class="section-dot"></span>
+          設備限制
+        </div>
+
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="smtMaxLength">SMT 最大長度 mm</label>
+            <input id="smtMaxLength" type="number" value="330" min="1" step="0.1" />
+          </div>
+
+          <div class="form-field">
+            <label for="smtMaxWidth">SMT 最大寬度 mm</label>
+            <input id="smtMaxWidth" type="number" value="250" min="1" step="0.1" />
+          </div>
+
+          <div class="form-field">
+            <label for="ictMaxLength">ICT 最大長度 mm</label>
+            <input id="ictMaxLength" type="number" value="350" min="1" step="0.1" />
+          </div>
+
+          <div class="form-field">
+            <label for="ictMaxWidth">ICT 最大寬度 mm</label>
+            <input id="ictMaxWidth" type="number" value="300" min="1" step="0.1" />
+          </div>
+        </div>
+      </div>
+
+      <div class="section-block">
+        <div class="section-header">
+          <span class="section-dot"></span>
+          製程與風險條件
+        </div>
+
+        <div class="process-grid">
+          <div class="process-card">
+            <label for="hasBgaQfn">BGA / QFN</label>
+            <select id="hasBgaQfn">
+              <option value="false">否</option>
+              <option value="true">是</option>
+            </select>
+          </div>
+
+          <div class="process-card">
+            <label for="hasDip">DIP</label>
+            <select id="hasDip">
+              <option value="false">否</option>
+              <option value="true">是</option>
+            </select>
+          </div>
+
+          <div class="process-card">
+            <label for="hasHeavyComponent">重零件</label>
+            <select id="hasHeavyComponent">
+              <option value="false">否</option>
+              <option value="true">是</option>
+            </select>
+          </div>
+
+          <div class="process-card">
+            <label for="isIrregularShape">異形板</label>
+            <select id="isIrregularShape">
+              <option value="false">否</option>
+              <option value="true">是</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-note">
+        提醒：本工具產出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
+      </div>
+    </div>
+
     <div id="resultBox" class="result">
-      <h2>上傳成功</h2>
+      <h2>AI 連版規劃完成</h2>
 
       <div class="field">
-        <div class="label">檔案名稱</div>
+        <div class="label">原始 DXF 檔名</div>
         <div id="filename"></div>
       </div>
 
       <div class="field">
-        <div class="label">檔案大小</div>
+        <div class="label">原始 DXF 檔案大小</div>
         <div id="filesize"></div>
       </div>
 
       <div class="field">
-        <div class="label">object_key，請複製到 Dify</div>
+        <div class="label">MinIO object_key</div>
         <div class="copy-row">
           <input id="objectKeyInput" class="copy-input" readonly />
-          <button class="small-btn" onclick="copyObjectKey()">複製</button>
+          <button class="small-btn" onclick="copyText('objectKeyInput')">複製</button>
         </div>
       </div>
 
       <div class="field">
-        <div class="label">file_id</div>
-        <div id="fileId"></div>
+        <div class="label">輸出 DXF 檔名</div>
+        <div id="outputFilename"></div>
       </div>
 
-      <div class="note">
-        下一步：打開 Dify 的 PCB DXF 連版規劃 GenAI，將上方 object_key 貼到 <code>object_key</code> 欄位。
+      <div class="field">
+        <div class="label">輸出 DXF 下載連結</div>
+        <a id="downloadLink" class="download-link" href="#" target="_blank" style="display:none;">
+          下載連版 DXF
+        </a>
       </div>
+
+      <div class="field">
+        <div class="label">PCB 連版規劃 AI 建議報告</div>
+        <div id="reportText" class="report-box"></div>
+      </div>
+
+      <details>
+        <summary>查看原始 Dify 回傳 JSON</summary>
+        <pre id="rawResult" class="raw-box"></pre>
+      </details>
     </div>
 
     <div id="errorBox" class="error"></div>
   </div>
 
   <script>
-    async function uploadFile() {
+    async function uploadAndRun() {
       const fileInput = document.getElementById("fileInput");
       const uploadBtn = document.getElementById("uploadBtn");
       const status = document.getElementById("status");
@@ -227,61 +591,310 @@
       resultBox.style.display = "none";
       errorBox.style.display = "none";
       errorBox.innerText = "";
+      status.innerText = "";
 
       if (!fileInput.files || fileInput.files.length === 0) {
-        errorBox.style.display = "block";
-        errorBox.innerText = "請先選擇 DXF 檔案。";
+        showError("請先選擇 DXF 檔案。");
         return;
       }
 
       const file = fileInput.files[0];
 
       if (!file.name.toLowerCase().endsWith(".dxf")) {
-        errorBox.style.display = "block";
-        errorBox.innerText = "只允許上傳 .dxf 檔案。";
+        showError("只允許上傳 .dxf 檔案。");
         return;
       }
 
-      const formData = new FormData();
-      formData.append("dxf_file", file);
+      if (!validateInputs()) {
+        return;
+      }
 
       uploadBtn.disabled = true;
-      status.innerText = "上傳中，請稍候...";
 
       try {
-        const response = await fetch("/api/pcb/upload-dxf-to-minio", {
-          method: "POST",
-          body: formData
-        });
+        status.innerText = "步驟 1/3：DXF 上傳到 MinIO 中，請稍候...";
 
-        const data = await response.json();
+        const uploadData = await uploadDxfToMinio(file);
 
-        if (!response.ok) {
-          throw new Error(data.detail || "上傳失敗");
-        }
+        document.getElementById("filename").innerText = uploadData.filename || "";
+        document.getElementById("filesize").innerText = formatBytes(uploadData.file_size_bytes || 0);
+        document.getElementById("objectKeyInput").value = uploadData.object_key || "";
 
-        document.getElementById("filename").innerText = data.filename || "";
-        document.getElementById("filesize").innerText = formatBytes(data.file_size_bytes || 0);
-        document.getElementById("objectKeyInput").value = data.object_key || "";
-        document.getElementById("fileId").innerText = data.file_id || "";
+        status.innerText = "步驟 2/3：已取得 object_key，正在呼叫 Dify Workflow 進行 AI 連版規劃...";
+
+        const difyResult = await runDifyWorkflow(uploadData.object_key);
+
+        status.innerText = "步驟 3/3：正在整理 AI 報告與 DXF 下載連結...";
+
+        renderDifyResult(difyResult);
 
         resultBox.style.display = "block";
-        status.innerText = "上傳完成。";
+        status.innerText = "完成：AI 連版規劃已完成。";
+
       } catch (error) {
-        errorBox.style.display = "block";
-        errorBox.innerText = "上傳失敗：" + error.message;
+        showError("執行失敗：\n" + error.message);
         status.innerText = "";
       } finally {
         uploadBtn.disabled = false;
       }
     }
 
-    function copyObjectKey() {
-      const input = document.getElementById("objectKeyInput");
+    async function uploadDxfToMinio(file) {
+      const formData = new FormData();
+      formData.append("dxf_file", file);
+
+      const response = await fetch("/api/pcb/upload-dxf-to-minio", {
+        method: "POST",
+        body: formData
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("上傳 API 回傳格式不是 JSON。");
+      }
+
+      if (!response.ok) {
+        throw new Error(data.detail || JSON.stringify(data));
+      }
+
+      if (!data.object_key) {
+        throw new Error("上傳成功但沒有取得 object_key。");
+      }
+
+      return data;
+    }
+
+    async function runDifyWorkflow(objectKey) {
+      const formData = new FormData();
+
+      formData.append("object_key", objectKey);
+      formData.append("product_name", getValue("productName"));
+      formData.append("single_board_length", getValue("singleBoardLength"));
+      formData.append("single_board_width", getValue("singleBoardWidth"));
+      formData.append("rail_width", getValue("railWidth"));
+      formData.append("smt_max_length", getValue("smtMaxLength"));
+      formData.append("smt_max_width", getValue("smtMaxWidth"));
+      formData.append("ict_max_length", getValue("ictMaxLength"));
+      formData.append("ict_max_width", getValue("ictMaxWidth"));
+      formData.append("has_bga_qfn", getValue("hasBgaQfn"));
+      formData.append("has_dip", getValue("hasDip"));
+      formData.append("has_heavy_component", getValue("hasHeavyComponent"));
+      formData.append("is_irregular_shape", getValue("isIrregularShape"));
+
+      const response = await fetch("/api/pcb/run-dify-panelization", {
+        method: "POST",
+        body: formData
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Dify API 回傳格式不是 JSON。");
+      }
+
+      if (!response.ok) {
+        throw new Error(JSON.stringify(data, null, 2));
+      }
+
+      return data;
+    }
+
+    function renderDifyResult(difyResult) {
+      document.getElementById("rawResult").innerText = JSON.stringify(difyResult, null, 2);
+
+      const outputs = extractOutputs(difyResult);
+
+      const reportText =
+        outputs.report_text ||
+        outputs.text ||
+        outputs.answer ||
+        extractAnyText(difyResult) ||
+        "未找到報告文字，請檢查 Dify End 節點輸出變數是否包含 report_text。";
+
+      document.getElementById("reportText").innerText = reportText;
+
+      const dxfInfo = extractDxfInfo(outputs, difyResult);
+
+      if (dxfInfo.output_filename) {
+        document.getElementById("outputFilename").innerText = dxfInfo.output_filename;
+      } else {
+        document.getElementById("outputFilename").innerText = "未找到輸出檔名，請檢查 Generate Panel DXF 回傳 body。";
+      }
+
+      const downloadLink = document.getElementById("downloadLink");
+
+      if (dxfInfo.download_url) {
+        downloadLink.href = dxfInfo.download_url;
+        downloadLink.style.display = "inline-block";
+      } else {
+        downloadLink.href = "#";
+        downloadLink.style.display = "none";
+      }
+    }
+
+    function extractOutputs(difyResult) {
+      if (difyResult && difyResult.data && difyResult.data.outputs) {
+        return difyResult.data.outputs;
+      }
+
+      if (difyResult && difyResult.outputs) {
+        return difyResult.outputs;
+      }
+
+      return {};
+    }
+
+    function extractDxfInfo(outputs, difyResult) {
+      const result = {
+        output_filename: "",
+        download_url: ""
+      };
+
+      const possibleKeys = [
+        "panel_dxf_info",
+        "panel_dxf",
+        "dxf_info",
+        "generate_panel_dxf",
+        "Generate Panel DXF"
+      ];
+
+      for (const key of possibleKeys) {
+        if (outputs[key]) {
+          const value = outputs[key];
+
+          if (typeof value === "string") {
+            try {
+              const obj = JSON.parse(value);
+              return parseDxfObject(obj);
+            } catch {
+              const url = findUrl(value);
+              if (url) result.download_url = url;
+            }
+          }
+
+          if (typeof value === "object") {
+            return parseDxfObject(value);
+          }
+        }
+      }
+
+      const wholeText = JSON.stringify(difyResult);
+      const url = findUrl(wholeText);
+      if (url) result.download_url = url;
+
+      const filenameMatch = wholeText.match(/panelized_[^"'\\\s]+\.dxf/);
+      if (filenameMatch) result.output_filename = filenameMatch[0];
+
+      return result;
+    }
+
+    function parseDxfObject(obj) {
+      const result = {
+        output_filename: "",
+        download_url: ""
+      };
+
+      if (!obj) return result;
+
+      result.output_filename =
+        obj.output_filename ||
+        obj.filename ||
+        obj.name ||
+        "";
+
+      result.download_url =
+        obj.download_url ||
+        obj.url ||
+        obj.file_url ||
+        "";
+
+      if (!result.download_url) {
+        const text = JSON.stringify(obj);
+        const url = findUrl(text);
+        if (url) result.download_url = url;
+      }
+
+      if (!result.output_filename) {
+        const text = JSON.stringify(obj);
+        const filenameMatch = text.match(/panelized_[^"'\\\s]+\.dxf/);
+        if (filenameMatch) result.output_filename = filenameMatch[0];
+      }
+
+      return result;
+    }
+
+    function extractAnyText(obj) {
+      const text = JSON.stringify(obj, null, 2);
+      const keys = ["report_text", "text", "answer"];
+
+      for (const key of keys) {
+        const regex = new RegExp('"' + key + '"\\s*:\\s*"([\\s\\S]*?)"', "m");
+        const match = text.match(regex);
+        if (match && match[1]) {
+          return match[1]
+            .replace(/\\n/g, "\n")
+            .replace(/\\"/g, '"');
+        }
+      }
+
+      return "";
+    }
+
+    function findUrl(text) {
+      if (!text) return "";
+      const match = text.match(/https?:\/\/[^"'\s\\]+/);
+      return match ? match[0] : "";
+    }
+
+    function validateInputs() {
+      const requiredIds = [
+        "productName",
+        "singleBoardLength",
+        "singleBoardWidth",
+        "railWidth",
+        "smtMaxLength",
+        "smtMaxWidth",
+        "ictMaxLength",
+        "ictMaxWidth"
+      ];
+
+      for (const id of requiredIds) {
+        const value = getValue(id);
+
+        if (value === "") {
+          showError("欄位不可空白：" + id);
+          return false;
+        }
+
+        if (id !== "productName" && Number(value) < 0) {
+          showError("數值不可小於 0：" + id);
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    function getValue(id) {
+      const el = document.getElementById(id);
+      return el ? el.value : "";
+    }
+
+    function copyText(inputId) {
+      const input = document.getElementById(inputId);
       input.select();
       input.setSelectionRange(0, 99999);
       navigator.clipboard.writeText(input.value);
-      alert("object_key 已複製。");
+      alert("已複製。");
+    }
+
+    function showError(message) {
+      const errorBox = document.getElementById("errorBox");
+      errorBox.style.display = "block";
+      errorBox.innerText = message;
     }
 
     function formatBytes(bytes) {
@@ -291,123 +904,6 @@
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
     }
-    <div class="form-card">
-  <div class="form-title">
-    PCB 連版條件
-    <span class="form-title-badge">Panelization Input</span>
-  </div>
-
-  <div class="form-subtitle">
-    請輸入單板尺寸、設備限制與製程條件。系統會根據這些資料與公司連板規範，產生連版建議與輸出 DXF。
-  </div>
-
-  <div class="section-block">
-    <div class="section-header">
-      <span class="section-dot"></span>
-      產品與單板基本資料
-    </div>
-
-    <div class="form-grid">
-      <div class="form-field full-width">
-        <label for="productName">產品名稱</label>
-        <input id="productName" value="TEST-PCB-001" placeholder="例如：ABC-001" />
-        <div class="form-hint">此名稱會用於報告與輸出 DXF 檔名。</div>
-      </div>
-
-      <div class="form-field">
-        <label for="singleBoardLength">單板長度 mm</label>
-        <input id="singleBoardLength" type="number" value="120" min="1" step="0.1" />
-      </div>
-
-      <div class="form-field">
-        <label for="singleBoardWidth">單板寬度 mm</label>
-        <input id="singleBoardWidth" type="number" value="80" min="1" step="0.1" />
-      </div>
-
-      <div class="form-field">
-        <label for="railWidth">工藝邊 mm</label>
-        <input id="railWidth" type="number" value="5" min="0" step="0.1" />
-        <div class="form-hint">建議初始值 5 mm，正式值請依公司規範確認。</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="section-block">
-    <div class="section-header">
-      <span class="section-dot"></span>
-      設備限制
-    </div>
-
-    <div class="form-grid">
-      <div class="form-field">
-        <label for="smtMaxLength">SMT 最大長度 mm</label>
-        <input id="smtMaxLength" type="number" value="330" min="1" step="0.1" />
-      </div>
-
-      <div class="form-field">
-        <label for="smtMaxWidth">SMT 最大寬度 mm</label>
-        <input id="smtMaxWidth" type="number" value="250" min="1" step="0.1" />
-      </div>
-
-      <div class="form-field">
-        <label for="ictMaxLength">ICT 最大長度 mm</label>
-        <input id="ictMaxLength" type="number" value="350" min="1" step="0.1" />
-      </div>
-
-      <div class="form-field">
-        <label for="ictMaxWidth">ICT 最大寬度 mm</label>
-        <input id="ictMaxWidth" type="number" value="300" min="1" step="0.1" />
-      </div>
-    </div>
-  </div>
-
-  <div class="section-block">
-    <div class="section-header">
-      <span class="section-dot"></span>
-      製程與風險條件
-    </div>
-
-    <div class="process-grid">
-      <div class="process-card">
-        <label for="hasBgaQfn">BGA / QFN</label>
-        <select id="hasBgaQfn">
-          <option value="false">否</option>
-          <option value="true">是</option>
-        </select>
-      </div>
-
-      <div class="process-card">
-        <label for="hasDip">DIP</label>
-        <select id="hasDip">
-          <option value="false">否</option>
-          <option value="true">是</option>
-        </select>
-      </div>
-
-      <div class="process-card">
-        <label for="hasHeavyComponent">重零件</label>
-        <select id="hasHeavyComponent">
-          <option value="false">否</option>
-          <option value="true">是</option>
-        </select>
-      </div>
-
-      <div class="process-card">
-        <label for="isIrregularShape">異形板</label>
-        <select id="isIrregularShape">
-          <option value="false">否</option>
-          <option value="true">是</option>
-        </select>
-      </div>
-    </div>
-  </div>
-
-  <div class="form-note">
-    提醒：本工具產出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
-  </div>
-</div>
   </script>
-
-
 </body>
 </html>
