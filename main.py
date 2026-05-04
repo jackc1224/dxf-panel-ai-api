@@ -769,10 +769,10 @@ async def run_dify_panelization(
     smt_max_width: str = Form("250"),
     ict_max_length: str = Form("350"),
     ict_max_width: str = Form("300"),
-"has_bga_qfn": normalize_yes_no(has_bga_qfn),
-"has_dip": normalize_yes_no(has_dip),
-"has_heavy_component": normalize_yes_no(has_heavy_component),
-"is_irregular_shape": normalize_yes_no(is_irregular_shape)
+    has_bga_qfn: str = Form("No"),
+    has_dip: str = Form("No"),
+    has_heavy_component: str = Form("No"),
+    is_irregular_shape: str = Form("No")
 ):
     if not DIFY_API_BASE:
         raise HTTPException(status_code=500, detail="DIFY_API_BASE is not configured")
