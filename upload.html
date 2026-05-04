@@ -105,18 +105,29 @@
       cursor: not-allowed;
     }
 
-    .secondary-btn {
-      background: #059669;
-    }
-
-    .secondary-btn:hover {
-      background: #047857;
-    }
-
     .small-btn {
       padding: 10px 14px;
       font-size: 14px;
       background: #059669;
+    }
+
+    .small-btn:hover {
+      background: #047857;
+    }
+
+    .download-link {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 12px 18px;
+      background: #2563eb;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 12px;
+      font-weight: 700;
+    }
+
+    .download-link:hover {
+      background: #1d4ed8;
     }
 
     .form-card {
@@ -217,6 +228,7 @@
     .form-hint {
       color: #9ca3af;
       font-size: 12px;
+      line-height: 1.6;
     }
 
     .full-width {
@@ -321,21 +333,6 @@
       background: #fff;
     }
 
-    .download-link {
-      display: inline-block;
-      margin-top: 8px;
-      padding: 12px 18px;
-      background: #2563eb;
-      color: #fff;
-      text-decoration: none;
-      border-radius: 12px;
-      font-weight: 700;
-    }
-
-    .download-link:hover {
-      background: #1d4ed8;
-    }
-
     .report-box {
       margin-top: 20px;
       padding: 20px;
@@ -347,19 +344,6 @@
       line-height: 1.7;
       max-height: 520px;
       overflow: auto;
-    }
-
-    .raw-box {
-      margin-top: 20px;
-      padding: 16px;
-      border-radius: 14px;
-      background: #111827;
-      color: #e5e7eb;
-      white-space: pre-wrap;
-      line-height: 1.6;
-      max-height: 400px;
-      overflow: auto;
-      font-size: 13px;
     }
 
     code {
@@ -400,7 +384,7 @@
 
     <div class="desc">
       請先選擇 PCB 單板 DXF 檔，並填寫連版條件。<br />
-      系統會自動將 DXF 上傳至 MinIO，接著呼叫 Dify Workflow 產生 AI 建議報告與連版 DXF 下載連結。
+      系統會將 DXF 上傳至 MinIO，產生 <code>object_key</code>。接著請將 <code>object_key</code> 貼到 Dify 進行連版規劃。
     </div>
 
     <div class="upload-box">
@@ -412,7 +396,7 @@
       <input id="fileInput" type="file" accept=".dxf" />
       <br />
 
-      <button id="uploadBtn" onclick="uploadAndRun()">上傳 DXF 並執行 AI 連版規劃</button>
+      <button id="uploadBtn" onclick="uploadOnly()">上傳 DXF 並取得 object_key</button>
 
       <div id="status" class="status"></div>
     </div>
@@ -424,7 +408,7 @@
       </div>
 
       <div class="form-subtitle">
-        請輸入單板尺寸、設備限制與製程條件。系統會根據這些資料與公司連板規範，產生連版建議與輸出 DXF。
+        請輸入單板尺寸、設備限制與製程條件。這些條件需在 Dify Workflow 中同步填入。
       </div>
 
       <div class="section-block">
@@ -437,7 +421,7 @@
           <div class="form-field full-width">
             <label for="productName">產品名稱</label>
             <input id="productName" value="TEST-PCB-001" placeholder="例如：ABC-001" />
-            <div class="form-hint">此名稱會用於報告與輸出 DXF 檔名。</div>
+            <div class="form-hint">此名稱會用於 Dify 報告與輸出 DXF 檔名。</div>
           </div>
 
           <div class="form-field">
@@ -493,13 +477,14 @@
           製程與風險條件
         </div>
 
-<div class="process-card">
-  <label for="hasBgaQfn">BGA / QFN</label>
-  <select id="hasBgaQfn">
-    <option value="No">否</option>
-    <option value="Yes">是</option>
-  </select>
-</div>
+        <div class="process-grid">
+          <div class="process-card">
+            <label for="hasBgaQfn">BGA / QFN</label>
+            <select id="hasBgaQfn">
+              <option value="No">否</option>
+              <option value="Yes">是</option>
+            </select>
+          </div>
 
           <div class="process-card">
             <label for="hasDip">DIP</label>
@@ -533,7 +518,7 @@
     </div>
 
     <div id="resultBox" class="result">
-      <h2>AI 連版規劃完成</h2>
+      <h2>DXF 上傳完成</h2>
 
       <div class="field">
         <div class="label">原始 DXF 檔名</div>
@@ -546,41 +531,38 @@
       </div>
 
       <div class="field">
-        <div class="label">MinIO object_key</div>
+        <div class="label">MinIO object_key，請複製到 Dify</div>
         <div class="copy-row">
           <input id="objectKeyInput" class="copy-input" readonly />
-          <button class="small-btn" onclick="copyText('objectKeyInput')">複製</button>
+          <button class="small-btn" onclick="copyText('objectKeyInput')">複製 object_key</button>
         </div>
       </div>
 
       <div class="field">
-        <div class="label">輸出 DXF 檔名</div>
-        <div id="outputFilename"></div>
-      </div>
-
-      <div class="field">
-        <div class="label">輸出 DXF 下載連結</div>
-        <a id="downloadLink" class="download-link" href="#" target="_blank" style="display:none;">
-          下載連版 DXF
+        <div class="label">下一步</div>
+        <a
+          class="download-link"
+          href="https://me-genai-dify-web.zeabur.app/app/80935502-80f0-4288-bdb2-078a331f9686/develop"
+          target="_blank"
+        >
+          開啟 Dify 連版規劃
         </a>
+        <div class="form-hint" style="margin-top: 10px;">
+          請先複製上方 object_key，開啟 Dify 後貼到 object_key 欄位，再填入相同的 PCB 條件並執行 Workflow。
+        </div>
       </div>
 
       <div class="field">
-        <div class="label">PCB 連版規劃 AI 建議報告</div>
+        <div class="label">操作說明</div>
         <div id="reportText" class="report-box"></div>
       </div>
-
-      <details>
-        <summary>查看原始 Dify 回傳 JSON</summary>
-        <pre id="rawResult" class="raw-box"></pre>
-      </details>
     </div>
 
     <div id="errorBox" class="error"></div>
   </div>
 
   <script>
-    async function uploadAndRun() {
+    async function uploadOnly() {
       const fileInput = document.getElementById("fileInput");
       const uploadBtn = document.getElementById("uploadBtn");
       const status = document.getElementById("status");
@@ -611,7 +593,7 @@
       uploadBtn.disabled = true;
 
       try {
-        status.innerText = "步驟 1/3：DXF 上傳到 MinIO 中，請稍候...";
+        status.innerText = "DXF 上傳到 MinIO 中，請稍候...";
 
         const uploadData = await uploadDxfToMinio(file);
 
@@ -619,23 +601,18 @@
         document.getElementById("filesize").innerText = formatBytes(uploadData.file_size_bytes || 0);
         document.getElementById("objectKeyInput").value = uploadData.object_key || "";
 
-        status.innerText = "步驟 2/3：已取得 object_key，正在呼叫 Dify Workflow 進行 AI 連版規劃...";
-
-        status.innerText = "DXF 上傳完成，請複製 object_key 到 Dify 執行連版規劃。";
-
-resultBox.style.display = "block";
-
-document.getElementById("reportText").innerText =
-  "DXF 已成功上傳至 MinIO。\n\n" +
-  "請複製上方 object_key，貼到 Dify 的 object_key 欄位後執行 Workflow。\n\n" +
-  "object_key：\n" + uploadData.object_key;
-
-        status.innerText = "步驟 3/3：正在整理 AI 報告與 DXF 下載連結...";
-
-        renderDifyResult(difyResult);
+        document.getElementById("reportText").innerText =
+          "DXF 已成功上傳至 MinIO。\n\n" +
+          "請依下列步驟繼續：\n\n" +
+          "1. 複製上方 object_key。\n" +
+          "2. 點擊「開啟 Dify 連版規劃」。\n" +
+          "3. 將 object_key 貼到 Dify 的 object_key 欄位。\n" +
+          "4. 將本頁 PCB 條件同步填入 Dify。\n" +
+          "5. 執行 Workflow，取得 AI 建議報告與連版 DXF。\n\n" +
+          "object_key：\n" + uploadData.object_key;
 
         resultBox.style.display = "block";
-        status.innerText = "完成：AI 連版規劃已完成。";
+        status.innerText = "完成：DXF 已上傳，請複製 object_key 到 Dify 執行連版規劃。";
 
       } catch (error) {
         showError("執行失敗：\n" + error.message);
@@ -654,15 +631,23 @@ document.getElementById("reportText").innerText =
         body: formData
       });
 
-      let data;
+      const rawText = await response.text();
+
+      let data = null;
+
       try {
-        data = await response.json();
-      } catch {
-        throw new Error("上傳 API 回傳格式不是 JSON。");
+        data = JSON.parse(rawText);
+      } catch (e) {
+        throw new Error(
+          "後端 /api/pcb/upload-dxf-to-minio 回傳不是 JSON。\n\n" +
+          "HTTP Status: " + response.status + "\n\n" +
+          "Raw Response 前 1500 字：\n" +
+          rawText.substring(0, 1500)
+        );
       }
 
       if (!response.ok) {
-        throw new Error(data.detail || JSON.stringify(data));
+        throw new Error(JSON.stringify(data, null, 2));
       }
 
       if (!data.object_key) {
@@ -670,197 +655,6 @@ document.getElementById("reportText").innerText =
       }
 
       return data;
-    }
-
-async function runDifyWorkflow(objectKey) {
-  const formData = new FormData();
-
-  formData.append("object_key", objectKey);
-  formData.append("product_name", getValue("productName"));
-  formData.append("single_board_length", getValue("singleBoardLength"));
-  formData.append("single_board_width", getValue("singleBoardWidth"));
-  formData.append("rail_width", getValue("railWidth"));
-  formData.append("smt_max_length", getValue("smtMaxLength"));
-  formData.append("smt_max_width", getValue("smtMaxWidth"));
-  formData.append("ict_max_length", getValue("ictMaxLength"));
-  formData.append("ict_max_width", getValue("ictMaxWidth"));
-  formData.append("has_bga_qfn", getValue("hasBgaQfn"));
-  formData.append("has_dip", getValue("hasDip"));
-  formData.append("has_heavy_component", getValue("hasHeavyComponent"));
-  formData.append("is_irregular_shape", getValue("isIrregularShape"));
-
-  const response = await fetch("/api/pcb/run-dify-panelization", {
-    method: "POST",
-    body: formData
-  });
-
-  const rawText = await response.text();
-
-  let data = null;
-
-  try {
-    data = JSON.parse(rawText);
-  } catch (e) {
-    throw new Error(
-      "後端 /api/pcb/run-dify-panelization 回傳不是 JSON。\n\n" +
-      "HTTP Status: " + response.status + "\n\n" +
-      "Raw Response 前 1500 字：\n" +
-      rawText.substring(0, 1500)
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error(JSON.stringify(data, null, 2));
-  }
-
-  return data;
-}
-
-    function renderDifyResult(difyResult) {
-      document.getElementById("rawResult").innerText = JSON.stringify(difyResult, null, 2);
-
-      const outputs = extractOutputs(difyResult);
-
-      const reportText =
-        outputs.report_text ||
-        outputs.text ||
-        outputs.answer ||
-        extractAnyText(difyResult) ||
-        "未找到報告文字，請檢查 Dify End 節點輸出變數是否包含 report_text。";
-
-      document.getElementById("reportText").innerText = reportText;
-
-      const dxfInfo = extractDxfInfo(outputs, difyResult);
-
-      if (dxfInfo.output_filename) {
-        document.getElementById("outputFilename").innerText = dxfInfo.output_filename;
-      } else {
-        document.getElementById("outputFilename").innerText = "未找到輸出檔名，請檢查 Generate Panel DXF 回傳 body。";
-      }
-
-      const downloadLink = document.getElementById("downloadLink");
-
-      if (dxfInfo.download_url) {
-        downloadLink.href = dxfInfo.download_url;
-        downloadLink.style.display = "inline-block";
-      } else {
-        downloadLink.href = "#";
-        downloadLink.style.display = "none";
-      }
-    }
-
-    function extractOutputs(difyResult) {
-      if (difyResult && difyResult.data && difyResult.data.outputs) {
-        return difyResult.data.outputs;
-      }
-
-      if (difyResult && difyResult.outputs) {
-        return difyResult.outputs;
-      }
-
-      return {};
-    }
-
-    function extractDxfInfo(outputs, difyResult) {
-      const result = {
-        output_filename: "",
-        download_url: ""
-      };
-
-      const possibleKeys = [
-        "panel_dxf_info",
-        "panel_dxf",
-        "dxf_info",
-        "generate_panel_dxf",
-        "Generate Panel DXF"
-      ];
-
-      for (const key of possibleKeys) {
-        if (outputs[key]) {
-          const value = outputs[key];
-
-          if (typeof value === "string") {
-            try {
-              const obj = JSON.parse(value);
-              return parseDxfObject(obj);
-            } catch {
-              const url = findUrl(value);
-              if (url) result.download_url = url;
-            }
-          }
-
-          if (typeof value === "object") {
-            return parseDxfObject(value);
-          }
-        }
-      }
-
-      const wholeText = JSON.stringify(difyResult);
-      const url = findUrl(wholeText);
-      if (url) result.download_url = url;
-
-      const filenameMatch = wholeText.match(/panelized_[^"'\\\s]+\.dxf/);
-      if (filenameMatch) result.output_filename = filenameMatch[0];
-
-      return result;
-    }
-
-    function parseDxfObject(obj) {
-      const result = {
-        output_filename: "",
-        download_url: ""
-      };
-
-      if (!obj) return result;
-
-      result.output_filename =
-        obj.output_filename ||
-        obj.filename ||
-        obj.name ||
-        "";
-
-      result.download_url =
-        obj.download_url ||
-        obj.url ||
-        obj.file_url ||
-        "";
-
-      if (!result.download_url) {
-        const text = JSON.stringify(obj);
-        const url = findUrl(text);
-        if (url) result.download_url = url;
-      }
-
-      if (!result.output_filename) {
-        const text = JSON.stringify(obj);
-        const filenameMatch = text.match(/panelized_[^"'\\\s]+\.dxf/);
-        if (filenameMatch) result.output_filename = filenameMatch[0];
-      }
-
-      return result;
-    }
-
-    function extractAnyText(obj) {
-      const text = JSON.stringify(obj, null, 2);
-      const keys = ["report_text", "text", "answer"];
-
-      for (const key of keys) {
-        const regex = new RegExp('"' + key + '"\\s*:\\s*"([\\s\\S]*?)"', "m");
-        const match = text.match(regex);
-        if (match && match[1]) {
-          return match[1]
-            .replace(/\\n/g, "\n")
-            .replace(/\\"/g, '"');
-        }
-      }
-
-      return "";
-    }
-
-    function findUrl(text) {
-      if (!text) return "";
-      const match = text.match(/https?:\/\/[^"'\s\\]+/);
-      return match ? match[0] : "";
     }
 
     function validateInputs() {
@@ -902,7 +696,7 @@ async function runDifyWorkflow(objectKey) {
       input.select();
       input.setSelectionRange(0, 99999);
       navigator.clipboard.writeText(input.value);
-      alert("已複製。");
+      alert("已複製 object_key。");
     }
 
     function showError(message) {
