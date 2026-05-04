@@ -782,30 +782,25 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
-    payload = {
-        "inputs": {
-            "product_name": str(product_name),
-            "object_key": str(object_key),
-            "single_board_length": str(single_board_length),
-            "single_board_width": str(single_board_width),
-            "rail_width": str(rail_width),
-            "smt_max_length": str(smt_max_length),
-            "smt_max_width": str(smt_max_width),
-            "ict_max_length": str(ict_max_length),
-            "ict_max_width": str(ict_max_width),
-            "has_bga_qfn": str(has_bga_qfn),
-            "has_dip": str(has_dip),
-            "has_heavy_component": str(has_heavy_component),
-            "is_irregular_shape": str(is_irregular_shape)
-        },
-        "response_mode": "blocking",
-        "user": "pcb-upload-page"
-    }
-
-    headers = {
-        "Authorization": f"Bearer {DIFY_API_KEY}",
-        "Content-Type": "application/json"
-    }
+payload = {
+    "inputs": {
+        "product_name": str(product_name),
+        "object_key": str(object_key),
+        "single_board_length": str(single_board_length),
+        "single_board_width": str(single_board_width),
+        "rail_width": str(rail_width),
+        "smt_max_length": str(smt_max_length),
+        "smt_max_width": str(smt_max_width),
+        "ict_max_length": str(ict_max_length),
+        "ict_max_width": str(ict_max_width),
+        "has_bga_qfn": normalize_yes_no(has_bga_qfn),
+        "has_dip": normalize_yes_no(has_dip),
+        "has_heavy_component": normalize_yes_no(has_heavy_component),
+        "is_irregular_shape": normalize_yes_no(is_irregular_shape)
+    },
+    "response_mode": "blocking",
+    "user": "pcb-upload-page"
+}
 
     try:
         response = requests.post(
