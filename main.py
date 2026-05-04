@@ -729,3 +729,72 @@ def download_from_minio(
         media_type="application/dxf",
         filename=os.path.basename(object_key)
     )
+@app.post("/api/pcb/run-dify-panelization")
+async def run_dify_panelization(
+    object_key: str = Form(...),
+    product_name: str = Form(...),
+    single_board_length: float = Form(...),
+    single_board_width: float = Form(...),
+    rail_width: float = Form(5.0),
+    smt_max_length: float = Form(330.0),
+    smt_max_width: float = Form(250.0),
+    ict_max_length: float = Form(350.0),
+    ict_max_width: float = Form(300.0),
+    has_bga_qfn: str = Form("false"),
+    has_dip: str = Form("false"),
+    has_heavy_component: str = Form("false"),
+    is_irregular_shape: str = Form("false")
+):
+    if not DIFY_API_BASE:
+        raise HTTPException(status_code=500, detail="DIFY_API_BASE is not configured")
+
+    if not DIFY_API_KEY:
+        raise HTTPException(status_code=500, detail="DIFY_API_KEY is not configured")
+
+    url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
+
+    payload = {
+        "inputs": {
+            "product_name": product_name,
+            "object_key": object_key,
+            "single_board_length": single_board_length,
+            "single_board_width": single_board_width,
+            "rail_width": rail_width,
+            "smt_max_length": smt_max_length,
+            "smt_max_width": smt_max_width,
+            "ict_max_length": ict_max_length,
+            "ict_max_width": ict_max_width,
+            "has_bga_qfn": has_bga_qfn,
+            "has_dip": has_dip,
+            "has_heavy_component": has_heavy_component,
+            "is_irregular_shape": is_irregular_shape
+        },
+        "response_mode": "blocking",
+        "user": "pcb-upload-page"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=180)
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail={
+                    "message": "Dify workflow API failed",
+                    "dify_status_code": response.status_code,
+                    "dify_response": response.text
+                }
+            )
+
+        return response.json()
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Dify workflow timeout")
+
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Dify request error: {str(e)}")
