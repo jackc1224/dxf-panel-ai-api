@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import os
 import tempfile
 import uuid
@@ -12,7 +12,7 @@ from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.3.0-minio")
+app = FastAPI(title="PCB Panelization API", version="0.4.0-minio-upload-page")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ app.add_middleware(
 
 
 # =========================================================
-# MinIO 設定
+# MinIO 環境變數設定
 # =========================================================
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "")
@@ -33,9 +33,10 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "pcb-dxf")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 
-UPLOAD_DIR = "/tmp/pcb_uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# =========================================================
+# MinIO 共用函式
+# =========================================================
 
 def get_minio_client() -> Minio:
     if not MINIO_ENDPOINT:
@@ -45,8 +46,10 @@ def get_minio_client() -> Minio:
     if not MINIO_SECRET_KEY:
         raise HTTPException(status_code=500, detail="MINIO_SECRET_KEY is not configured")
 
+    endpoint = MINIO_ENDPOINT.replace("https://", "").replace("http://", "")
+
     return Minio(
-        endpoint=MINIO_ENDPOINT.replace("https://", "").replace("http://", ""),
+        endpoint=endpoint,
         access_key=MINIO_ACCESS_KEY,
         secret_key=MINIO_SECRET_KEY,
         secure=MINIO_SECURE,
@@ -55,6 +58,7 @@ def get_minio_client() -> Minio:
 
 def ensure_bucket_exists():
     client = get_minio_client()
+
     try:
         found = client.bucket_exists(MINIO_BUCKET)
         if not found:
@@ -63,7 +67,11 @@ def ensure_bucket_exists():
         raise HTTPException(status_code=500, detail=f"MinIO bucket error: {str(e)}")
 
 
-def upload_file_to_minio(local_path: str, object_name: str, content_type: str = "application/dxf"):
+def upload_file_to_minio(
+    local_path: str,
+    object_name: str,
+    content_type: str = "application/dxf"
+):
     ensure_bucket_exists()
     client = get_minio_client()
 
@@ -89,7 +97,10 @@ def download_file_from_minio(object_name: str, local_path: str):
             file_path=local_path,
         )
     except S3Error as e:
-        raise HTTPException(status_code=404, detail=f"MinIO object not found or download failed: {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"MinIO object not found or download failed: {str(e)}"
+        )
 
 
 def get_presigned_download_url(object_name: str, hours: int = 24) -> str:
@@ -103,21 +114,10 @@ def get_presigned_download_url(object_name: str, hours: int = 24) -> str:
             expires=timedelta(hours=hours),
         )
     except S3Error as e:
-        raise HTTPException(status_code=500, detail=f"MinIO presigned url error: {str(e)}")
-
-
-def get_presigned_upload_url(object_name: str, hours: int = 2) -> str:
-    ensure_bucket_exists()
-    client = get_minio_client()
-
-    try:
-        return client.presigned_put_object(
-            bucket_name=MINIO_BUCKET,
-            object_name=object_name,
-            expires=timedelta(hours=hours),
+        raise HTTPException(
+            status_code=500,
+            detail=f"MinIO presigned url error: {str(e)}"
         )
-    except S3Error as e:
-        raise HTTPException(status_code=500, detail=f"MinIO presigned upload url error: {str(e)}")
 
 
 # =========================================================
@@ -129,21 +129,50 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.3.0-minio",
-        "minio_bucket": MINIO_BUCKET,
-        "message": "Use /docs to test API."
+        "version": "0.4.0-minio-upload-page",
+        "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
+
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_page():
+    html_path = os.path.join(os.getcwd(), "upload.html")
+
+    if not os.path.exists(html_path):
+        raise HTTPException(status_code=404, detail="upload.html not found")
+
+    with open(html_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 @app.get("/api/health/minio")
 def health_minio():
-    ensure_bucket_exists()
-    return {
-        "status": "ok",
-        "message": "MinIO connection success",
-        "bucket": MINIO_BUCKET,
-        "endpoint": MINIO_ENDPOINT
-    }
+    try:
+        client = get_minio_client()
+        bucket_exists = client.bucket_exists(MINIO_BUCKET)
+
+        if not bucket_exists:
+            client.make_bucket(MINIO_BUCKET)
+
+        return {
+            "status": "ok",
+            "message": "MinIO connection success",
+            "bucket": MINIO_BUCKET,
+            "endpoint": MINIO_ENDPOINT,
+            "secure": MINIO_SECURE,
+            "bucket_created_or_exists": True
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "MinIO connection failed",
+            "endpoint": MINIO_ENDPOINT,
+            "secure": MINIO_SECURE,
+            "bucket": MINIO_BUCKET,
+            "error_type": type(e).__name__,
+            "error_detail": str(e)
+        }
 
 
 # =========================================================
@@ -188,11 +217,15 @@ def calculate_candidates(
         risk_score = 0
 
         if panel_length > smt_max_length:
-            reasons.append(f"Panel 長度 {panel_length:.1f} mm 超過 SMT 最大長度 {smt_max_length:.1f} mm")
+            reasons.append(
+                f"Panel 長度 {panel_length:.1f} mm 超過 SMT 最大長度 {smt_max_length:.1f} mm"
+            )
             risk_score += 100
 
         if panel_width > smt_max_width:
-            reasons.append(f"Panel 寬度 {panel_width:.1f} mm 超過 SMT 最大寬度 {smt_max_width:.1f} mm")
+            reasons.append(
+                f"Panel 寬度 {panel_width:.1f} mm 超過 SMT 最大寬度 {smt_max_width:.1f} mm"
+            )
             risk_score += 100
 
         if ict_max_length > 0 and ict_max_width > 0:
@@ -203,7 +236,9 @@ def calculate_candidates(
         aspect_ratio = max(panel_length, panel_width) / min(panel_length, panel_width)
 
         if aspect_ratio > 3:
-            reasons.append(f"Panel 長寬比 {aspect_ratio:.2f} 過大，可能有板彎或輸送不穩風險")
+            reasons.append(
+                f"Panel 長寬比 {aspect_ratio:.2f} 過大，可能有板彎或輸送不穩風險"
+            )
             risk_score += 25
 
         if is_irregular_shape:
@@ -258,7 +293,10 @@ def calculate_candidates(
     if recommended:
         best_candidate = recommended[0]
     else:
-        best_candidate = sorted(candidates, key=lambda x: (x["risk_score"], -x["pcs_per_panel"]))[0]
+        best_candidate = sorted(
+            candidates,
+            key=lambda x: (x["risk_score"], -x["pcs_per_panel"])
+        )[0]
 
     return {
         "best_candidate": best_candidate,
@@ -420,14 +458,17 @@ def create_panel_dxf(
 
     content = dxf_header()
 
+    # Panel 外框
     content += dxf_rect(0, 0, panel_length, panel_width, "PANEL")
 
+    # 單板排列
     for i in range(x_count):
         for j in range(y_count):
             x = rail_width + i * single_board_length
             y = rail_width + j * single_board_width
             content += dxf_rect(x, y, single_board_length, single_board_width, "BOARD")
 
+    # V-cut 線
     for i in range(1, x_count):
         x = rail_width + i * single_board_length
         content += dxf_line(x, rail_width, x, panel_width - rail_width, "VCUT")
@@ -436,6 +477,7 @@ def create_panel_dxf(
         y = rail_width + j * single_board_width
         content += dxf_line(rail_width, y, panel_length - rail_width, y, "VCUT")
 
+    # Tooling holes，直徑 3.2 mm，半徑 1.6 mm
     hole_r = 1.6
     offset = max(rail_width / 2, 2.5)
 
@@ -444,7 +486,9 @@ def create_panel_dxf(
     content += dxf_circle(offset, panel_width - offset, hole_r, "TOOLING")
     content += dxf_circle(panel_length - offset, panel_width - offset, hole_r, "TOOLING")
 
+    # Fiducial，半徑 0.75 mm
     fid_r = 0.75
+
     content += dxf_circle(rail_width, rail_width, fid_r, "FIDUCIAL")
     content += dxf_circle(panel_length - rail_width, rail_width, fid_r, "FIDUCIAL")
     content += dxf_circle(rail_width, panel_width - rail_width, fid_r, "FIDUCIAL")
@@ -456,7 +500,7 @@ def create_panel_dxf(
 
 
 # =========================================================
-# MinIO Upload Flow
+# API：上傳 DXF 到 MinIO
 # =========================================================
 
 @app.post("/api/pcb/upload-dxf-to-minio")
@@ -470,54 +514,45 @@ async def upload_dxf_to_minio(
         raise HTTPException(status_code=400, detail="Only .dxf file is allowed")
 
     file_id = str(uuid.uuid4())
-    safe_filename = dxf_file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    object_name = f"uploads/{file_id}/{safe_filename}"
+    safe_filename = (
+        dxf_file.filename
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+    )
 
+    object_key = f"uploads/{file_id}/{safe_filename}"
     tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{safe_filename}")
 
     with open(tmp_path, "wb") as buffer:
         shutil.copyfileobj(dxf_file.file, buffer)
 
+    file_size = os.path.getsize(tmp_path)
+
     upload_file_to_minio(
         local_path=tmp_path,
-        object_name=object_name,
+        object_name=object_key,
         content_type="application/dxf",
     )
 
-    file_size = os.path.getsize(tmp_path)
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
 
     return {
         "status": "success",
         "file_id": file_id,
-        "object_key": object_name,
+        "object_key": object_key,
         "filename": safe_filename,
         "file_size_bytes": file_size,
         "message": "DXF uploaded to MinIO successfully. Use object_key in Dify workflow."
     }
 
 
-@app.post("/api/pcb/create-upload-url")
-async def create_upload_url(
-    filename: str = Form(...)
-):
-    if not filename.lower().endswith(".dxf"):
-        raise HTTPException(status_code=400, detail="Only .dxf file is allowed")
-
-    file_id = str(uuid.uuid4())
-    safe_filename = filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    object_key = f"uploads/{file_id}/{safe_filename}"
-
-    upload_url = get_presigned_upload_url(object_key, hours=2)
-
-    return {
-        "status": "success",
-        "file_id": file_id,
-        "object_key": object_key,
-        "upload_url": upload_url,
-        "expires_hours": 2,
-        "message": "Use HTTP PUT to upload DXF to upload_url, then pass object_key to Dify."
-    }
-
+# =========================================================
+# API：用 MinIO object_key 產生候選方案
+# =========================================================
 
 @app.post("/api/pcb/generate-panel-candidates-from-minio")
 async def generate_panel_candidates_from_minio(
@@ -538,6 +573,11 @@ async def generate_panel_candidates_from_minio(
     # 第一階段目前不真正解析 DXF 幾何，但先確認 MinIO 檔案可下載
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
+
+    try:
+        os.remove(local_input)
+    except Exception:
+        pass
 
     result = calculate_candidates(
         single_board_length,
@@ -573,6 +613,10 @@ async def generate_panel_candidates_from_minio(
     }
 
 
+# =========================================================
+# API：用 MinIO object_key 產生連版 DXF，並上傳回 MinIO
+# =========================================================
+
 @app.post("/api/pcb/generate-panel-dxf-from-minio")
 async def generate_panel_dxf_from_minio(
     object_key: str = Form(...),
@@ -589,9 +633,14 @@ async def generate_panel_dxf_from_minio(
     has_heavy_component: bool = Form(False),
     is_irregular_shape: bool = Form(False)
 ):
-    # 確認原始 DXF 存在
+    # 確認原始 DXF 可以從 MinIO 下載
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
+
+    try:
+        os.remove(local_input)
+    except Exception:
+        pass
 
     result = calculate_candidates(
         single_board_length,
@@ -609,7 +658,13 @@ async def generate_panel_dxf_from_minio(
 
     candidate = result["best_candidate"]
 
-    safe_name = product_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    safe_name = (
+        product_name
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
     output_name = f"panelized_{safe_name}_{candidate['panel_type']}.dxf"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_name}")
 
@@ -630,6 +685,11 @@ async def generate_panel_dxf_from_minio(
         content_type="application/dxf",
     )
 
+    try:
+        os.remove(output_path)
+    except Exception:
+        pass
+
     download_url = get_presigned_download_url(output_object_key, hours=24)
 
     return {
@@ -645,11 +705,19 @@ async def generate_panel_dxf_from_minio(
     }
 
 
+# =========================================================
+# API：下載 MinIO 內的 DXF
+# =========================================================
+
 @app.get("/api/pcb/download")
 def download_from_minio(
     object_key: str
 ):
-    local_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{os.path.basename(object_key)}")
+    local_path = os.path.join(
+        tempfile.gettempdir(),
+        f"{uuid.uuid4()}_{os.path.basename(object_key)}"
+    )
+
     download_file_from_minio(object_key, local_path)
 
     return FileResponse(
