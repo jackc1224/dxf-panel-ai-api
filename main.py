@@ -33,6 +33,9 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "pcb-dxf")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
+DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
+DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
+
 
 
 # =========================================================
