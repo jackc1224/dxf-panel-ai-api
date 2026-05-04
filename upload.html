@@ -291,7 +291,121 @@
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
     }
-    
+    <div class="form-card">
+  <div class="form-title">
+    PCB 連版條件
+    <span class="form-title-badge">Panelization Input</span>
+  </div>
+
+  <div class="form-subtitle">
+    請輸入單板尺寸、設備限制與製程條件。系統會根據這些資料與公司連板規範，產生連版建議與輸出 DXF。
+  </div>
+
+  <div class="section-block">
+    <div class="section-header">
+      <span class="section-dot"></span>
+      產品與單板基本資料
+    </div>
+
+    <div class="form-grid">
+      <div class="form-field full-width">
+        <label for="productName">產品名稱</label>
+        <input id="productName" value="TEST-PCB-001" placeholder="例如：ABC-001" />
+        <div class="form-hint">此名稱會用於報告與輸出 DXF 檔名。</div>
+      </div>
+
+      <div class="form-field">
+        <label for="singleBoardLength">單板長度 mm</label>
+        <input id="singleBoardLength" type="number" value="120" min="1" step="0.1" />
+      </div>
+
+      <div class="form-field">
+        <label for="singleBoardWidth">單板寬度 mm</label>
+        <input id="singleBoardWidth" type="number" value="80" min="1" step="0.1" />
+      </div>
+
+      <div class="form-field">
+        <label for="railWidth">工藝邊 mm</label>
+        <input id="railWidth" type="number" value="5" min="0" step="0.1" />
+        <div class="form-hint">建議初始值 5 mm，正式值請依公司規範確認。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-block">
+    <div class="section-header">
+      <span class="section-dot"></span>
+      設備限制
+    </div>
+
+    <div class="form-grid">
+      <div class="form-field">
+        <label for="smtMaxLength">SMT 最大長度 mm</label>
+        <input id="smtMaxLength" type="number" value="330" min="1" step="0.1" />
+      </div>
+
+      <div class="form-field">
+        <label for="smtMaxWidth">SMT 最大寬度 mm</label>
+        <input id="smtMaxWidth" type="number" value="250" min="1" step="0.1" />
+      </div>
+
+      <div class="form-field">
+        <label for="ictMaxLength">ICT 最大長度 mm</label>
+        <input id="ictMaxLength" type="number" value="350" min="1" step="0.1" />
+      </div>
+
+      <div class="form-field">
+        <label for="ictMaxWidth">ICT 最大寬度 mm</label>
+        <input id="ictMaxWidth" type="number" value="300" min="1" step="0.1" />
+      </div>
+    </div>
+  </div>
+
+  <div class="section-block">
+    <div class="section-header">
+      <span class="section-dot"></span>
+      製程與風險條件
+    </div>
+
+    <div class="process-grid">
+      <div class="process-card">
+        <label for="hasBgaQfn">BGA / QFN</label>
+        <select id="hasBgaQfn">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+
+      <div class="process-card">
+        <label for="hasDip">DIP</label>
+        <select id="hasDip">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+
+      <div class="process-card">
+        <label for="hasHeavyComponent">重零件</label>
+        <select id="hasHeavyComponent">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+
+      <div class="process-card">
+        <label for="isIrregularShape">異形板</label>
+        <select id="isIrregularShape">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="form-note">
+    提醒：本工具產出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
+  </div>
+</div>
   </script>
 
 
