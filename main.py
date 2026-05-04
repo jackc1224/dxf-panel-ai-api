@@ -4,16 +4,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
 import os
 import tempfile
-import requests
 import uuid
 import shutil
 from datetime import timedelta
+import requests
 
 from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.4.0-minio-upload-page")
+app = FastAPI(title="PCB Panelization API", version="0.5.0-minio-dify")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,9 +33,14 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "pcb-dxf")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
+
+
+# =========================================================
+# Dify 環境變數設定
+# =========================================================
+
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
-
 
 
 # =========================================================
@@ -45,8 +50,10 @@ DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
 def get_minio_client() -> Minio:
     if not MINIO_ENDPOINT:
         raise HTTPException(status_code=500, detail="MINIO_ENDPOINT is not configured")
+
     if not MINIO_ACCESS_KEY:
         raise HTTPException(status_code=500, detail="MINIO_ACCESS_KEY is not configured")
+
     if not MINIO_SECRET_KEY:
         raise HTTPException(status_code=500, detail="MINIO_SECRET_KEY is not configured")
 
@@ -65,8 +72,10 @@ def ensure_bucket_exists():
 
     try:
         found = client.bucket_exists(MINIO_BUCKET)
+
         if not found:
             client.make_bucket(MINIO_BUCKET)
+
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO bucket error: {str(e)}")
 
@@ -86,6 +95,7 @@ def upload_file_to_minio(
             file_path=local_path,
             content_type=content_type,
         )
+
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO upload error: {str(e)}")
 
@@ -100,6 +110,7 @@ def download_file_from_minio(object_name: str, local_path: str):
             object_name=object_name,
             file_path=local_path,
         )
+
     except S3Error as e:
         raise HTTPException(
             status_code=404,
@@ -117,6 +128,7 @@ def get_presigned_download_url(object_name: str, hours: int = 24) -> str:
             object_name=object_name,
             expires=timedelta(hours=hours),
         )
+
     except S3Error as e:
         raise HTTPException(
             status_code=500,
@@ -133,7 +145,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.4.0-minio-upload-page",
+        "version": "0.5.0-minio-dify",
         "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
 
@@ -177,6 +189,16 @@ def health_minio():
             "error_type": type(e).__name__,
             "error_detail": str(e)
         }
+
+
+@app.get("/api/health/dify")
+def health_dify():
+    return {
+        "status": "ok" if DIFY_API_BASE and DIFY_API_KEY else "error",
+        "DIFY_API_BASE_configured": bool(DIFY_API_BASE),
+        "DIFY_API_KEY_configured": bool(DIFY_API_KEY),
+        "DIFY_API_BASE": DIFY_API_BASE
+    }
 
 
 # =========================================================
@@ -729,6 +751,12 @@ def download_from_minio(
         media_type="application/dxf",
         filename=os.path.basename(object_key)
     )
+
+
+# =========================================================
+# API：由 upload.html 後端呼叫 Dify Workflow
+# =========================================================
+
 @app.post("/api/pcb/run-dify-panelization")
 async def run_dify_panelization(
     object_key: str = Form(...),
@@ -753,21 +781,24 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
+    # 注意：
+    # Dify Start 表單若是 text-input，API inputs 必須傳 string
+    # 因此這裡全部用 str()，避免 type error
     payload = {
         "inputs": {
-            "product_name": product_name,
-            "object_key": object_key,
-            "single_board_length": single_board_length,
-            "single_board_width": single_board_width,
-            "rail_width": rail_width,
-            "smt_max_length": smt_max_length,
-            "smt_max_width": smt_max_width,
-            "ict_max_length": ict_max_length,
-            "ict_max_width": ict_max_width,
-            "has_bga_qfn": has_bga_qfn,
-            "has_dip": has_dip,
-            "has_heavy_component": has_heavy_component,
-            "is_irregular_shape": is_irregular_shape
+            "product_name": str(product_name),
+            "object_key": str(object_key),
+            "single_board_length": str(single_board_length),
+            "single_board_width": str(single_board_width),
+            "rail_width": str(rail_width),
+            "smt_max_length": str(smt_max_length),
+            "smt_max_width": str(smt_max_width),
+            "ict_max_length": str(ict_max_length),
+            "ict_max_width": str(ict_max_width),
+            "has_bga_qfn": str(has_bga_qfn),
+            "has_dip": str(has_dip),
+            "has_heavy_component": str(has_heavy_component),
+            "is_irregular_shape": str(is_irregular_shape)
         },
         "response_mode": "blocking",
         "user": "pcb-upload-page"
@@ -779,7 +810,12 @@ async def run_dify_panelization(
     }
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=180)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=180
+        )
 
         if response.status_code >= 400:
             raise HTTPException(
