@@ -758,6 +758,16 @@ def download_from_minio(
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
+def normalize_yes_no(value: str) -> str:
+    v = str(value).strip().lower()
+
+    if v in ["yes", "true", "1", "是", "y"]:
+        return "Yes"
+
+    if v in ["no", "false", "0", "否", "n"]:
+        return "No"
+
+    return "No"
 async def run_dify_panelization(
     object_key: str = Form(...),
     product_name: str = Form(...),
@@ -768,10 +778,10 @@ async def run_dify_panelization(
     smt_max_width: str = Form("250"),
     ict_max_length: str = Form("350"),
     ict_max_width: str = Form("300"),
-    has_bga_qfn: str = Form("false"),
-    has_dip: str = Form("false"),
-    has_heavy_component: str = Form("false"),
-    is_irregular_shape: str = Form("false")
+"has_bga_qfn": normalize_yes_no(has_bga_qfn),
+"has_dip": normalize_yes_no(has_dip),
+"has_heavy_component": normalize_yes_no(has_heavy_component),
+"is_irregular_shape": normalize_yes_no(is_irregular_shape)
 ):
     if not DIFY_API_BASE:
         raise HTTPException(status_code=500, detail="DIFY_API_BASE is not configured")
