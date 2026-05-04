@@ -13,7 +13,7 @@ from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.5.0-minio-dify")
+app = FastAPI(title="PCB Panelization API", version="0.6.0-minio-dify-fixed")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +41,35 @@ MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
+
+
+# =========================================================
+# 共用工具
+# =========================================================
+
+def normalize_yes_no(value: str) -> str:
+    """
+    Dify Select 欄位只接受 Yes / No。
+    前端可能傳 true / false、是 / 否，這裡統一轉換。
+    """
+    v = str(value).strip().lower()
+
+    if v in ["yes", "true", "1", "是", "y"]:
+        return "Yes"
+
+    if v in ["no", "false", "0", "否", "n"]:
+        return "No"
+
+    return "No"
+
+
+def safe_filename_name(filename: str) -> str:
+    return (
+        filename
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+    )
 
 
 # =========================================================
@@ -145,7 +174,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.5.0-minio-dify",
+        "version": "0.6.0-minio-dify-fixed",
         "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
 
@@ -540,12 +569,7 @@ async def upload_dxf_to_minio(
         raise HTTPException(status_code=400, detail="Only .dxf file is allowed")
 
     file_id = str(uuid.uuid4())
-    safe_filename = (
-        dxf_file.filename
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(" ", "_")
-    )
+    safe_filename = safe_filename_name(dxf_file.filename)
 
     object_key = f"uploads/{file_id}/{safe_filename}"
     tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{safe_filename}")
@@ -684,12 +708,7 @@ async def generate_panel_dxf_from_minio(
 
     candidate = result["best_candidate"]
 
-    safe_name = (
-        product_name
-        .replace(" ", "_")
-        .replace("/", "_")
-        .replace("\\", "_")
-    )
+    safe_name = safe_filename_name(product_name)
 
     output_name = f"panelized_{safe_name}_{candidate['panel_type']}.dxf"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_name}")
@@ -758,16 +777,6 @@ def download_from_minio(
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
-def normalize_yes_no(value: str) -> str:
-    v = str(value).strip().lower()
-
-    if v in ["yes", "true", "1", "是", "y"]:
-        return "Yes"
-
-    if v in ["no", "false", "0", "否", "n"]:
-        return "No"
-
-    return "No"    
 async def run_dify_panelization(
     object_key: str = Form(...),
     product_name: str = Form(...),
@@ -791,25 +800,33 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
-payload = {
-    "inputs": {
-        "product_name": str(product_name),
-        "object_key": str(object_key),
-        "single_board_length": str(single_board_length),
-        "single_board_width": str(single_board_width),
-        "rail_width": str(rail_width),
-        "smt_max_length": str(smt_max_length),
-        "smt_max_width": str(smt_max_width),
-        "ict_max_length": str(ict_max_length),
-        "ict_max_width": str(ict_max_width),
-        "has_bga_qfn": normalize_yes_no(has_bga_qfn),
-        "has_dip": normalize_yes_no(has_dip),
-        "has_heavy_component": normalize_yes_no(has_heavy_component),
-        "is_irregular_shape": normalize_yes_no(is_irregular_shape)
-    },
-    "response_mode": "blocking",
-    "user": "pcb-upload-page"
-}
+    # 注意：
+    # Dify Start 表單若是 text-input，API inputs 必須傳 string。
+    # Dify Select 欄位只接受 Yes / No，所以用 normalize_yes_no() 轉換。
+    payload = {
+        "inputs": {
+            "product_name": str(product_name),
+            "object_key": str(object_key),
+            "single_board_length": str(single_board_length),
+            "single_board_width": str(single_board_width),
+            "rail_width": str(rail_width),
+            "smt_max_length": str(smt_max_length),
+            "smt_max_width": str(smt_max_width),
+            "ict_max_length": str(ict_max_length),
+            "ict_max_width": str(ict_max_width),
+            "has_bga_qfn": normalize_yes_no(has_bga_qfn),
+            "has_dip": normalize_yes_no(has_dip),
+            "has_heavy_component": normalize_yes_no(has_heavy_component),
+            "is_irregular_shape": normalize_yes_no(is_irregular_shape)
+        },
+        "response_mode": "blocking",
+        "user": "pcb-upload-page"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
     try:
         response = requests.post(
