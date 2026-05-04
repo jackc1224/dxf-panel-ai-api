@@ -761,13 +761,13 @@ def download_from_minio(
 async def run_dify_panelization(
     object_key: str = Form(...),
     product_name: str = Form(...),
-    single_board_length: float = Form(...),
-    single_board_width: float = Form(...),
-    rail_width: float = Form(5.0),
-    smt_max_length: float = Form(330.0),
-    smt_max_width: float = Form(250.0),
-    ict_max_length: float = Form(350.0),
-    ict_max_width: float = Form(300.0),
+    single_board_length: str = Form(...),
+    single_board_width: str = Form(...),
+    rail_width: str = Form("5"),
+    smt_max_length: str = Form("330"),
+    smt_max_width: str = Form("250"),
+    ict_max_length: str = Form("350"),
+    ict_max_width: str = Form("300"),
     has_bga_qfn: str = Form("false"),
     has_dip: str = Form("false"),
     has_heavy_component: str = Form("false"),
@@ -781,9 +781,6 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
-    # 注意：
-    # Dify Start 表單若是 text-input，API inputs 必須傳 string
-    # 因此這裡全部用 str()，避免 type error
     payload = {
         "inputs": {
             "product_name": str(product_name),
@@ -823,6 +820,7 @@ async def run_dify_panelization(
                 detail={
                     "message": "Dify workflow API failed",
                     "dify_status_code": response.status_code,
+                    "sent_payload": payload,
                     "dify_response": response.text
                 }
             )
