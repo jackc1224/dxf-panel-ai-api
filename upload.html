@@ -5,131 +5,163 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PCB DXF 上傳工具</title>
   <style>
-    body {
-      font-family: Arial, "Microsoft JhengHei", sans-serif;
-      background: #f4f6f8;
-      margin: 0;
-      padding: 0;
-      color: #222;
+<style>
+  .form-card {
+    margin-top: 28px;
+    padding: 28px;
+    border-radius: 18px;
+    background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+  }
+
+  .form-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+    font-size: 24px;
+    font-weight: 700;
+    color: #111827;
+  }
+
+  .form-title-badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #dbeafe;
+    color: #1d4ed8;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .form-subtitle {
+    margin-bottom: 24px;
+    color: #6b7280;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .section-block {
+    margin-top: 22px;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+    color: #374151;
+    font-weight: 700;
+    font-size: 16px;
+  }
+
+  .section-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: #2563eb;
+  }
+
+  .form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 20px;
+  }
+
+  .form-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .form-field label {
+    font-size: 14px;
+    font-weight: 600;
+    color: #374151;
+  }
+
+  .form-field input,
+  .form-field select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px 13px;
+    border-radius: 12px;
+    border: 1px solid #d1d5db;
+    background: #ffffff;
+    color: #111827;
+    font-size: 15px;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  }
+
+  .form-field input:focus,
+  .form-field select:focus {
+    border-color: #2563eb;
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+    background: #fff;
+  }
+
+  .form-hint {
+    color: #9ca3af;
+    font-size: 12px;
+  }
+
+  .full-width {
+    grid-column: 1 / -1;
+  }
+
+  .process-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .process-card {
+    padding: 14px;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    background: #ffffff;
+  }
+
+  .process-card label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    color: #374151;
+  }
+
+  .process-card select {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid #d1d5db;
+    background: #f9fafb;
+    font-size: 14px;
+  }
+
+  .form-note {
+    margin-top: 22px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    background: #eff6ff;
+    color: #1e40af;
+    font-size: 14px;
+    line-height: 1.7;
+    border: 1px solid #bfdbfe;
+  }
+
+  @media (max-width: 720px) {
+    .form-grid,
+    .process-grid {
+      grid-template-columns: 1fr;
     }
 
-    .container {
-      max-width: 760px;
-      margin: 60px auto;
-      background: #fff;
-      padding: 36px;
-      border-radius: 16px;
-      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+    .form-card {
+      padding: 22px;
     }
-
-    h1 {
-      margin-top: 0;
-      color: #1f2937;
-      font-size: 28px;
-    }
-
-    .desc {
-      color: #555;
-      line-height: 1.7;
-      margin-bottom: 28px;
-    }
-
-    .upload-box {
-      border: 2px dashed #9ca3af;
-      border-radius: 14px;
-      padding: 32px;
-      text-align: center;
-      background: #fafafa;
-      margin-bottom: 24px;
-    }
-
-    input[type="file"] {
-      margin: 16px 0;
-      font-size: 16px;
-    }
-
-    button {
-      background: #2563eb;
-      color: #fff;
-      border: none;
-      padding: 12px 24px;
-      border-radius: 10px;
-      font-size: 16px;
-      cursor: pointer;
-    }
-
-    button:disabled {
-      background: #9ca3af;
-      cursor: not-allowed;
-    }
-
-    .result {
-      display: none;
-      margin-top: 24px;
-      padding: 20px;
-      border-radius: 12px;
-      background: #ecfdf5;
-      border: 1px solid #10b981;
-    }
-
-    .error {
-      display: none;
-      margin-top: 24px;
-      padding: 20px;
-      border-radius: 12px;
-      background: #fef2f2;
-      border: 1px solid #ef4444;
-      color: #991b1b;
-    }
-
-    .field {
-      margin: 14px 0;
-    }
-
-    .label {
-      font-weight: bold;
-      margin-bottom: 6px;
-    }
-
-    .copy-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-
-    input.copy-input {
-      flex: 1;
-      padding: 10px;
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      font-size: 14px;
-      background: #fff;
-    }
-
-    .note {
-      margin-top: 20px;
-      color: #666;
-      font-size: 14px;
-      line-height: 1.6;
-    }
-
-    .small-btn {
-      padding: 10px 14px;
-      font-size: 14px;
-      background: #059669;
-    }
-
-    .status {
-      margin-top: 14px;
-      color: #374151;
-      font-size: 14px;
-    }
-
-    code {
-      background: #f3f4f6;
-      padding: 2px 6px;
-      border-radius: 4px;
-    }
+  }
+</style>
   </style>
 </head>
 <body>
