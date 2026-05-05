@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
@@ -6,14 +6,15 @@ import os
 import tempfile
 import uuid
 import shutil
-from datetime import timedelta
+from datetime import timedelta, datetime
 import requests
+import traceback
 
 from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.7.0-minio-dify-debug")
+app = FastAPI(title="PCB Panelization API", version="0.8.0-minio-dify-async-job")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +42,14 @@ MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
+
+
+# =========================================================
+# 背景任務暫存
+# 注意：這是 MVP 版本，服務重啟後 job 記錄會消失
+# =========================================================
+
+JOB_STORE: Dict[str, Dict[str, Any]] = {}
 
 
 # =========================================================
@@ -181,7 +190,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.7.0-minio-dify-debug",
+        "version": "0.8.0-minio-dify-async-job",
         "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
 
@@ -521,17 +530,14 @@ def create_panel_dxf(
 
     content = dxf_header()
 
-    # Panel 外框
     content += dxf_rect(0, 0, panel_length, panel_width, "PANEL")
 
-    # 單板排列
     for i in range(x_count):
         for j in range(y_count):
             x = rail_width + i * single_board_length
             y = rail_width + j * single_board_width
             content += dxf_rect(x, y, single_board_length, single_board_width, "BOARD")
 
-    # V-cut 線
     for i in range(1, x_count):
         x = rail_width + i * single_board_length
         content += dxf_line(x, rail_width, x, panel_width - rail_width, "VCUT")
@@ -540,7 +546,6 @@ def create_panel_dxf(
         y = rail_width + j * single_board_width
         content += dxf_line(rail_width, y, panel_length - rail_width, y, "VCUT")
 
-    # Tooling holes，直徑 3.2 mm，半徑 1.6 mm
     hole_r = 1.6
     offset = max(rail_width / 2, 2.5)
 
@@ -549,7 +554,6 @@ def create_panel_dxf(
     content += dxf_circle(offset, panel_width - offset, hole_r, "TOOLING")
     content += dxf_circle(panel_length - offset, panel_width - offset, hole_r, "TOOLING")
 
-    # Fiducial，半徑 0.75 mm
     fid_r = 0.75
 
     content += dxf_circle(rail_width, rail_width, fid_r, "FIDUCIAL")
@@ -610,6 +614,7 @@ async def upload_dxf_to_minio(
 
 # =========================================================
 # API：用 MinIO object_key 產生候選方案
+# 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
 @app.post("/api/pcb/generate-panel-candidates-from-minio")
@@ -628,7 +633,6 @@ async def generate_panel_candidates_from_minio(
     has_heavy_component: bool = Form(False),
     is_irregular_shape: bool = Form(False)
 ):
-    # 第一階段目前不真正解析 DXF 幾何，但先確認 MinIO 檔案可下載
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
 
@@ -673,6 +677,7 @@ async def generate_panel_candidates_from_minio(
 
 # =========================================================
 # API：用 MinIO object_key 產生連版 DXF，並上傳回 MinIO
+# 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
 @app.post("/api/pcb/generate-panel-dxf-from-minio")
@@ -691,7 +696,6 @@ async def generate_panel_dxf_from_minio(
     has_heavy_component: bool = Form(False),
     is_irregular_shape: bool = Form(False)
 ):
-    # 確認原始 DXF 可以從 MinIO 下載
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
 
@@ -781,7 +785,179 @@ def download_from_minio(
 
 
 # =========================================================
-# API：由 upload.html 後端呼叫 Dify Workflow
+# 背景任務：呼叫 Dify Workflow
+# 不再 blocking 等待瀏覽器，避免 502 Bad Gateway
+# =========================================================
+
+def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
+    JOB_STORE[job_id]["status"] = "running"
+    JOB_STORE[job_id]["message"] = "Dify Workflow 執行中..."
+    JOB_STORE[job_id]["started_at"] = datetime.utcnow().isoformat()
+
+    try:
+        if not DIFY_API_BASE:
+            raise Exception("DIFY_API_BASE is not configured")
+
+        if not DIFY_API_KEY:
+            raise Exception("DIFY_API_KEY is not configured")
+
+        url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
+
+        payload = {
+            "inputs": {
+                "product_name": str(inputs.get("product_name", "")),
+                "object_key": str(inputs.get("object_key", "")),
+                "single_board_length": str(inputs.get("single_board_length", "")),
+                "single_board_width": str(inputs.get("single_board_width", "")),
+                "rail_width": str(inputs.get("rail_width", "5")),
+                "smt_max_length": str(inputs.get("smt_max_length", "330")),
+                "smt_max_width": str(inputs.get("smt_max_width", "250")),
+                "ict_max_length": str(inputs.get("ict_max_length", "350")),
+                "ict_max_width": str(inputs.get("ict_max_width", "300")),
+                "has_bga_qfn": normalize_yes_no(inputs.get("has_bga_qfn", "No")),
+                "has_dip": normalize_yes_no(inputs.get("has_dip", "No")),
+                "has_heavy_component": normalize_yes_no(inputs.get("has_heavy_component", "No")),
+                "is_irregular_shape": normalize_yes_no(inputs.get("is_irregular_shape", "No"))
+            },
+            "response_mode": "blocking",
+            "user": "pcb-upload-page"
+        }
+
+        headers = {
+            "Authorization": f"Bearer {DIFY_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=600
+        )
+
+        if response.status_code >= 400:
+            JOB_STORE[job_id]["status"] = "failed"
+            JOB_STORE[job_id]["message"] = "Dify Workflow API failed"
+            JOB_STORE[job_id]["error"] = {
+                "dify_status_code": response.status_code,
+                "dify_url": url,
+                "sent_payload": payload,
+                "dify_response": response.text
+            }
+            JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
+            return
+
+        content_type = response.headers.get("content-type", "")
+
+        if "application/json" not in content_type:
+            JOB_STORE[job_id]["status"] = "failed"
+            JOB_STORE[job_id]["message"] = "Dify API returned non-JSON response"
+            JOB_STORE[job_id]["error"] = {
+                "dify_status_code": response.status_code,
+                "content_type": content_type,
+                "dify_url": url,
+                "sent_payload": payload,
+                "dify_response_preview": response.text[:1500]
+            }
+            JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
+            return
+
+        result_json = response.json()
+
+        JOB_STORE[job_id]["status"] = "success"
+        JOB_STORE[job_id]["message"] = "Dify Workflow 執行完成"
+        JOB_STORE[job_id]["result"] = result_json
+        JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
+
+    except Exception as e:
+        JOB_STORE[job_id]["status"] = "failed"
+        JOB_STORE[job_id]["message"] = "Dify Workflow 執行失敗"
+        JOB_STORE[job_id]["error"] = {
+            "error_type": type(e).__name__,
+            "error_detail": str(e),
+            "traceback": traceback.format_exc()
+        }
+        JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
+
+
+# =========================================================
+# API：開始 Dify 背景任務
+# upload.html 會呼叫這支，不會等待 Dify 完成
+# =========================================================
+
+@app.post("/api/pcb/start-dify-job")
+async def start_dify_job(
+    background_tasks: BackgroundTasks,
+    object_key: str = Form(...),
+    product_name: str = Form(...),
+    single_board_length: str = Form(...),
+    single_board_width: str = Form(...),
+    rail_width: str = Form("5"),
+    smt_max_length: str = Form("330"),
+    smt_max_width: str = Form("250"),
+    ict_max_length: str = Form("350"),
+    ict_max_width: str = Form("300"),
+    has_bga_qfn: str = Form("No"),
+    has_dip: str = Form("No"),
+    has_heavy_component: str = Form("No"),
+    is_irregular_shape: str = Form("No")
+):
+    job_id = str(uuid.uuid4())
+
+    inputs = {
+        "object_key": object_key,
+        "product_name": product_name,
+        "single_board_length": single_board_length,
+        "single_board_width": single_board_width,
+        "rail_width": rail_width,
+        "smt_max_length": smt_max_length,
+        "smt_max_width": smt_max_width,
+        "ict_max_length": ict_max_length,
+        "ict_max_width": ict_max_width,
+        "has_bga_qfn": has_bga_qfn,
+        "has_dip": has_dip,
+        "has_heavy_component": has_heavy_component,
+        "is_irregular_shape": is_irregular_shape
+    }
+
+    JOB_STORE[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "任務已建立，等待背景執行",
+        "inputs": inputs,
+        "created_at": datetime.utcnow().isoformat(),
+        "started_at": None,
+        "finished_at": None,
+        "result": None,
+        "error": None
+    }
+
+    background_tasks.add_task(run_dify_job_background, job_id, inputs)
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "message": "Dify Workflow background job started."
+    }
+
+
+# =========================================================
+# API：查詢 Dify 背景任務狀態
+# upload.html 每 3 秒查詢這支
+# =========================================================
+
+@app.get("/api/pcb/job-status/{job_id}")
+def get_job_status(job_id: str):
+    job = JOB_STORE.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+
+    return job
+
+
+# =========================================================
+# 舊版同步 API：保留但不建議前端使用
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
@@ -808,8 +984,6 @@ async def run_dify_panelization(
 
     url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
-    # Dify Start 表單若是 text-input，API inputs 必須傳 string。
-    # Dify Select 欄位只接受 Yes / No，所以用 normalize_yes_no() 轉換。
     payload = {
         "inputs": {
             "product_name": str(product_name),
@@ -840,7 +1014,7 @@ async def run_dify_panelization(
             url,
             json=payload,
             headers=headers,
-            timeout=180
+            timeout=600
         )
 
         if response.status_code >= 400:
