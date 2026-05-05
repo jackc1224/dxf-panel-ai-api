@@ -9,6 +9,8 @@ import shutil
 from datetime import timedelta, datetime
 import requests
 import traceback
+import json
+import re
 
 from minio import Minio
 from minio.error import S3Error
@@ -104,6 +106,13 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def status_to_zh(status_code: str) -> str:
     mapping = {
         "recommended": "建議",
@@ -159,6 +168,183 @@ def select_display_candidates(candidates: List[Dict[str, Any]], limit: int = 3) 
     )
 
     return sorted_candidates[:limit]
+
+
+# =========================================================
+# strategy_json 解析與套用
+# =========================================================
+
+def parse_strategy_json(strategy_json: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    解析 Dify Generate Panel Strategy 輸出的 JSON。
+
+    可處理：
+    1. 空字串
+    2. ```json ... ``` 包起來的內容
+    3. 前後有多餘文字，但中間有 JSON object
+    """
+
+    if not strategy_json or not str(strategy_json).strip():
+        return None, None
+
+    raw = str(strategy_json).strip()
+
+    raw = raw.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed, None
+        return None, "strategy_json parsed but is not an object"
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if match:
+        candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "extracted strategy_json is not an object"
+        except Exception as e:
+            return None, f"json.loads extracted object failed: {str(e)}"
+
+    return None, "strategy_json is not valid JSON"
+
+
+def get_strategy_source(strategy: Optional[Dict[str, Any]]) -> str:
+    if not strategy:
+        return "default_rule"
+    return str(strategy.get("strategy_source", "knowledge_base_or_default_rule"))
+
+
+def get_strategy_layout(strategy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not strategy:
+        return {}
+
+    layout = strategy.get("layout", {})
+    if isinstance(layout, dict):
+        return layout
+
+    return {}
+
+
+def get_strategy_cutting_method(strategy: Optional[Dict[str, Any]], default_method: str) -> str:
+    if not strategy:
+        return default_method
+
+    cutting_rule = strategy.get("cutting_rule", {})
+    if isinstance(cutting_rule, dict):
+        method = cutting_rule.get("method")
+        if method:
+            return str(method)
+
+    method = strategy.get("recommended_method")
+    if method:
+        return str(method)
+
+    return default_method
+
+
+def apply_strategy_to_candidate(
+    base_candidate: Dict[str, Any],
+    strategy: Optional[Dict[str, Any]],
+    board_w: float,
+    board_h: float,
+    default_rail_width: float
+) -> Dict[str, Any]:
+    """
+    用 strategy_json 覆蓋 candidate。
+
+    覆蓋項目：
+    1. columns / rows
+    2. gap_x_mm / gap_y_mm
+    3. rail_left/right/top/bottom
+    4. split_method
+    5. panel_size
+    """
+
+    candidate = dict(base_candidate)
+
+    layout = get_strategy_layout(strategy)
+
+    columns = to_int(layout.get("columns", candidate.get("x_count", candidate.get("columns", 1))), 1)
+    rows = to_int(layout.get("rows", candidate.get("y_count", candidate.get("rows", 1))), 1)
+
+    if columns <= 0:
+        columns = 1
+
+    if rows <= 0:
+        rows = 1
+
+    gap_x = to_float(layout.get("gap_x_mm", candidate.get("gap_x_mm", 0.0)), 0.0)
+    gap_y = to_float(layout.get("gap_y_mm", candidate.get("gap_y_mm", 0.0)), 0.0)
+
+    rail_left = to_float(layout.get("rail_left_mm", candidate.get("rail_left_mm", default_rail_width)), default_rail_width)
+    rail_right = to_float(layout.get("rail_right_mm", candidate.get("rail_right_mm", default_rail_width)), default_rail_width)
+    rail_top = to_float(layout.get("rail_top_mm", candidate.get("rail_top_mm", default_rail_width)), default_rail_width)
+    rail_bottom = to_float(layout.get("rail_bottom_mm", candidate.get("rail_bottom_mm", default_rail_width)), default_rail_width)
+
+    split_method = get_strategy_cutting_method(strategy, candidate.get("split_method", "V-cut"))
+
+    panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
+    panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
+
+    candidate["panel_type"] = f"{columns}x{rows}"
+    candidate["x_count"] = columns
+    candidate["y_count"] = rows
+    candidate["columns"] = columns
+    candidate["rows"] = rows
+    candidate["gap_x_mm"] = gap_x
+    candidate["gap_y_mm"] = gap_y
+    candidate["rail_left_mm"] = rail_left
+    candidate["rail_right_mm"] = rail_right
+    candidate["rail_top_mm"] = rail_top
+    candidate["rail_bottom_mm"] = rail_bottom
+    candidate["panel_length_mm"] = round(panel_w, 2)
+    candidate["panel_width_mm"] = round(panel_h, 2)
+    candidate["panel_size"] = f"{panel_w:.1f} x {panel_h:.1f} mm"
+    candidate["pcs_per_panel"] = columns * rows
+    candidate["split_method"] = split_method
+    candidate["strategy_override_applied"] = bool(strategy)
+
+    if strategy:
+        candidate["strategy_source"] = get_strategy_source(strategy)
+        candidate["strategy_layout"] = layout
+        candidate["strategy_cutting_rule"] = strategy.get("cutting_rule", {})
+        candidate["strategy_risk_items"] = strategy.get("risk_items", [])
+        candidate["strategy_me_cam_check_items"] = strategy.get("me_cam_check_items", [])
+
+    return candidate
+
+
+def update_result_with_strategy_candidate(
+    result: Dict[str, Any],
+    strategy_candidate: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    將 strategy_candidate 放入 result，讓報告與 DXF 都以策略方案為主。
+    all_candidates 仍保留原始候選方案，但 display_candidates 第一個固定為 strategy_candidate。
+    """
+
+    updated = dict(result)
+    all_candidates = list(result.get("all_candidates", []))
+
+    updated["best_candidate"] = strategy_candidate
+
+    filtered = [
+        c for c in all_candidates
+        if c.get("panel_type") != strategy_candidate.get("panel_type")
+    ]
+
+    display_candidates = [strategy_candidate] + select_display_candidates(filtered, limit=2)
+
+    updated["display_candidates"] = display_candidates
+    updated["all_candidates"] = all_candidates
+    updated["candidates"] = all_candidates
+
+    return updated
 
 
 # =========================================================
@@ -267,7 +453,8 @@ def root():
         "message": "Use /upload for DXF upload page, or /docs for API testing.",
         "important_note": "This version includes real DXF panelization by reading source DXF entities with ezdxf.",
         "display_rule": "Report only shows top 3 display_candidates. all_candidates are still kept for debugging.",
-        "panel_feature_rule": "Auto determines Fiducial and Tooling Hole positions based on panel feature rule v1."
+        "panel_feature_rule": "Auto determines Fiducial and Tooling Hole positions based on strategy_json or panel feature rule v1.",
+        "strategy_json": "Generate Panel DXF API accepts strategy_json from Dify Generate Panel Strategy."
     }
 
 
@@ -444,6 +631,10 @@ def calculate_candidates(
             "rows": y_count,
             "gap_x_mm": gap_x,
             "gap_y_mm": gap_y,
+            "rail_left_mm": rail_width,
+            "rail_right_mm": rail_width,
+            "rail_top_mm": rail_width,
+            "rail_bottom_mm": rail_width,
             "panel_length_mm": round(panel_length, 2),
             "panel_width_mm": round(panel_width, 2),
             "panel_size": f"{panel_length:.1f} x {panel_width:.1f} mm",
@@ -591,15 +782,43 @@ Tooling Hole 配置：
 """.strip()
 
 
+def build_strategy_summary_text(strategy: Optional[Dict[str, Any]], strategy_applied: bool, strategy_parse_error: Optional[str]) -> str:
+    if strategy_applied and strategy:
+        return f"""
+- 策略套用狀態：已套用 strategy_json
+- 策略來源：{get_strategy_source(strategy)}
+- 建議分板方式：{strategy.get("recommended_method", "")}
+- Layout：{json.dumps(strategy.get("layout", {}), ensure_ascii=False)}
+- Fiducial Rule：{json.dumps(strategy.get("fiducial_rule", {}), ensure_ascii=False)}
+- Tooling Hole Rule：{json.dumps(strategy.get("tooling_hole_rule", {}), ensure_ascii=False)}
+""".strip()
+
+    if strategy_parse_error:
+        return f"""
+- 策略套用狀態：未套用 strategy_json
+- 原因：strategy_json 解析失敗
+- 錯誤訊息：{strategy_parse_error}
+- 系統已改用內建保守規則產生 DXF
+""".strip()
+
+    return """
+- 策略套用狀態：未收到 strategy_json
+- 系統使用內建保守規則產生 DXF
+""".strip()
+
+
 def build_ai_report_markdown(
     product_name: str,
     object_key: str,
     result: Dict[str, Any],
-    panel_dxf: Optional[Dict[str, Any]] = None
+    panel_dxf: Optional[Dict[str, Any]] = None,
+    strategy: Optional[Dict[str, Any]] = None,
+    strategy_applied: bool = False,
+    strategy_parse_error: Optional[str] = None
 ) -> str:
     best = result["best_candidate"]
-    comparison_table = build_comparison_table_markdown(result["all_candidates"], limit=3)
-    caution_text = build_caution_and_not_summary(result["all_candidates"], limit=3)
+    comparison_table = build_comparison_table_markdown(result.get("display_candidates", result["all_candidates"]), limit=3)
+    caution_text = build_caution_and_not_summary(result.get("display_candidates", result["all_candidates"]), limit=3)
 
     dxf_info = ""
     feature_text = ""
@@ -624,6 +843,8 @@ def build_ai_report_markdown(
 - 配置規則：{rule_summary}
 """.strip()
 
+    strategy_text = build_strategy_summary_text(strategy, strategy_applied, strategy_parse_error)
+
     report = f"""
 # PCB 連版規劃 AI 建議報告
 
@@ -644,23 +865,27 @@ def build_ai_report_markdown(
 
 {comparison_table}
 
-## 三、推薦方案說明
+## 三、知識庫策略套用說明
+
+{strategy_text}
+
+## 四、推薦方案說明
 
 本次系統推薦方案為 {best["panel_type"]}，Panel 尺寸為 {best["panel_size"]}，每 Panel 可生產 {best["pcs_per_panel"]} pcs，建議分板方式為 {best["split_method"]}。此方案風險分數為 {best["risk_score"]}，風險等級為「{best["risk_level_zh"]}」，狀態為「{best["status_zh"]}」。主要判斷原因：{best["reason_text"]}
 
-## 四、前三個候選方案中，謹慎使用與不建議方案原因
+## 五、前三個候選方案中，謹慎使用與不建議方案原因
 
 {caution_text}
 
-## 五、DXF 輸出資訊
+## 六、DXF 輸出資訊
 
 {dxf_info if dxf_info else "DXF 已由系統產生，請於下載連結取得。"}
 
-## 六、Fiducial / Tooling Hole 自動配置
+## 七、Fiducial / Tooling Hole 自動配置
 
 {feature_text if feature_text else "尚未取得 Fiducial / Tooling Hole 配置資訊。"}
 
-## 七、製程風險提醒
+## 八、製程風險提醒
 
 - 若有 BGA/QFN，需確認元件距離 V-cut 或 Router 邊界的安全距離。
 - 若有 DIP，需確認波峰焊方向、錫流方向與治具需求。
@@ -668,7 +893,7 @@ def build_ai_report_markdown(
 - 若為異形板，通常不建議直接使用 V-cut，建議優先評估 Router 或 Tab。
 - 若 Panel 尺寸超過 SMT 或 ICT 限制，該方案應列為不建議。
 
-## 八、ME / CAM 最終確認清單
+## 九、ME / CAM 最終確認清單
 
 - 單板尺寸是否正確。
 - Panel 尺寸是否符合 SMT 最大進板限制。
@@ -677,9 +902,10 @@ def build_ai_report_markdown(
 - Fiducial 數量、位置與直徑是否符合公司連板設計規範。
 - Tooling Hole 數量、孔徑與位置是否符合治具定位需求。
 - 若工藝邊不足，需確認是否加寬工藝邊或調整定位孔位置。
+- V-cut / Router / Tab 是否符合分板應力與製程限制。
 - 是否需要補強支撐、治具或調整過爐方向。
 
-## 九、輸出限制說明
+## 十、輸出限制說明
 
 本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
 """
@@ -771,6 +997,46 @@ def add_text(msp, text: str, x: float, y: float, height: float, layer: str):
         pass
 
 
+def position_to_xy(position: str, panel_w: float, panel_h: float, margin: float) -> Tuple[float, float]:
+    p = str(position).strip().lower()
+
+    mapping = {
+        "bottom-left": (margin, margin),
+        "bottom-right": (panel_w - margin, margin),
+        "top-left": (margin, panel_h - margin),
+        "top-right": (panel_w - margin, panel_h - margin),
+        "left-top": (margin, panel_h - margin),
+        "right-top": (panel_w - margin, panel_h - margin),
+        "left-bottom": (margin, margin),
+        "right-bottom": (panel_w - margin, margin),
+        "center-left": (margin, panel_h / 2.0),
+        "center-right": (panel_w - margin, panel_h / 2.0),
+        "top-center": (panel_w / 2.0, panel_h - margin),
+        "bottom-center": (panel_w / 2.0, margin),
+        "center": (panel_w / 2.0, panel_h / 2.0),
+    }
+
+    return mapping.get(p, (margin, margin))
+
+
+def normalize_positions(positions: Any, default_positions: List[str], count: int) -> List[str]:
+    if isinstance(positions, list):
+        output = [str(p) for p in positions if str(p).strip()]
+    else:
+        output = []
+
+    if not output:
+        output = list(default_positions)
+
+    while len(output) < count:
+        for p in default_positions:
+            if len(output) >= count:
+                break
+            output.append(p)
+
+    return output[:count]
+
+
 def auto_determine_panel_features(
     panel_w: float,
     panel_h: float,
@@ -781,42 +1047,50 @@ def auto_determine_panel_features(
     has_bga_qfn: bool = False,
     has_dip: bool = False,
     has_heavy_component: bool = False,
-    is_irregular_shape: bool = False
+    is_irregular_shape: bool = False,
+    strategy: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     PCB 連版 Fiducial / Tooling Hole 自動判斷規則。
 
-    保守通用版：
-    1. Fiducial：3 顆，放左上、右上、左下，避免完全對稱造成方向誤判。
-    2. Tooling Hole：4 顆，放四角工藝邊。
-    3. 若工藝邊不足，仍產生位置，但在 warning 中提醒 ME/CAM 確認。
-    4. 若為異形板或 Router / Tab，定位點仍優先放 Panel 工藝邊。
+    優先順序：
+    1. 若 strategy_json 有 fiducial_rule / tooling_hole_rule，優先使用。
+    2. 若無 strategy_json，使用內建保守規則。
     """
 
     warnings: List[str] = []
     notes: List[str] = []
 
-    fiducial_diameter_mm = 1.0
+    fiducial_rule = {}
+    tooling_hole_rule = {}
+
+    if strategy and isinstance(strategy.get("fiducial_rule"), dict):
+        fiducial_rule = strategy.get("fiducial_rule", {})
+
+    if strategy and isinstance(strategy.get("tooling_hole_rule"), dict):
+        tooling_hole_rule = strategy.get("tooling_hole_rule", {})
+
+    fiducial_diameter_mm = to_float(fiducial_rule.get("diameter_mm", 1.0), 1.0)
     fiducial_radius_mm = fiducial_diameter_mm / 2.0
+    fiducial_count = to_int(fiducial_rule.get("count", 3), 3)
+    fiducial_clearance_mm = to_float(fiducial_rule.get("clearance_mm", 4.0), 4.0)
 
-    tooling_hole_diameter_mm = 3.2
+    tooling_hole_diameter_mm = to_float(tooling_hole_rule.get("diameter_mm", 3.2), 3.2)
     tooling_hole_radius_mm = tooling_hole_diameter_mm / 2.0
+    tooling_hole_count = to_int(tooling_hole_rule.get("count", 4), 4)
+    tooling_clearance_mm = to_float(tooling_hole_rule.get("clearance_mm", 5.0), 5.0)
 
-    min_rail_for_fiducial_mm = 4.0
-    min_rail_for_tooling_mm = 5.0
+    if fiducial_count <= 0:
+        fiducial_count = 3
 
-    min_edge_clearance_fiducial_mm = 4.0
-    min_edge_clearance_tooling_mm = 5.0
+    if tooling_hole_count <= 0:
+        tooling_hole_count = 4
 
-    tooling_margin = max(
-        min_edge_clearance_tooling_mm,
-        rail_width / 2.0
-    )
+    min_rail_for_fiducial_mm = fiducial_clearance_mm
+    min_rail_for_tooling_mm = tooling_clearance_mm
 
-    fiducial_margin = max(
-        min_edge_clearance_fiducial_mm,
-        rail_width / 2.0
-    )
+    tooling_margin = max(tooling_clearance_mm, rail_width / 2.0)
+    fiducial_margin = max(fiducial_clearance_mm, rail_width / 2.0)
 
     tooling_margin = min(
         tooling_margin,
@@ -832,12 +1106,12 @@ def auto_determine_panel_features(
 
     if rail_width < min_rail_for_fiducial_mm:
         warnings.append(
-            f"工藝邊 {rail_width:.1f} mm 小於 Fiducial 建議工藝邊 {min_rail_for_fiducial_mm:.1f} mm，請 ME/CAM 確認是否需加寬工藝邊。"
+            f"工藝邊 {rail_width:.1f} mm 小於 Fiducial 建議 clearance {min_rail_for_fiducial_mm:.1f} mm，請 ME/CAM 確認是否需加寬工藝邊。"
         )
 
     if rail_width < min_rail_for_tooling_mm:
         warnings.append(
-            f"工藝邊 {rail_width:.1f} mm 小於 Tooling Hole 建議工藝邊 {min_rail_for_tooling_mm:.1f} mm，定位孔可能過於靠近板邊。"
+            f"工藝邊 {rail_width:.1f} mm 小於 Tooling Hole 建議 clearance {min_rail_for_tooling_mm:.1f} mm，定位孔可能過於靠近板邊。"
         )
 
     if has_bga_qfn:
@@ -852,83 +1126,78 @@ def auto_determine_panel_features(
     if is_irregular_shape or "Router" in split_method or "Tab" in split_method:
         notes.append("異形板或 Router / Tab 分板時，Fiducial 與 Tooling Hole 優先放在 Panel 工藝邊。")
 
-    tooling_holes = [
-        {
-            "name": "TH1",
-            "x": round(tooling_margin, 3),
-            "y": round(tooling_margin, 3),
-            "diameter_mm": tooling_hole_diameter_mm,
-            "radius_mm": tooling_hole_radius_mm,
-            "location": "bottom-left"
-        },
-        {
-            "name": "TH2",
-            "x": round(panel_w - tooling_margin, 3),
-            "y": round(tooling_margin, 3),
-            "diameter_mm": tooling_hole_diameter_mm,
-            "radius_mm": tooling_hole_radius_mm,
-            "location": "bottom-right"
-        },
-        {
-            "name": "TH3",
-            "x": round(tooling_margin, 3),
-            "y": round(panel_h - tooling_margin, 3),
-            "diameter_mm": tooling_hole_diameter_mm,
-            "radius_mm": tooling_hole_radius_mm,
-            "location": "top-left"
-        },
-        {
-            "name": "TH4",
-            "x": round(panel_w - tooling_margin, 3),
-            "y": round(panel_h - tooling_margin, 3),
-            "diameter_mm": tooling_hole_diameter_mm,
-            "radius_mm": tooling_hole_radius_mm,
-            "location": "top-right"
-        }
-    ]
+    if fiducial_rule.get("reason"):
+        notes.append(f"Fiducial 策略原因：{fiducial_rule.get('reason')}")
 
-    fiducials = [
-        {
-            "name": "FD1",
-            "x": round(fiducial_margin, 3),
-            "y": round(panel_h - fiducial_margin, 3),
+    if tooling_hole_rule.get("reason"):
+        notes.append(f"Tooling Hole 策略原因：{tooling_hole_rule.get('reason')}")
+
+    default_tooling_positions = ["bottom-left", "bottom-right", "top-left", "top-right"]
+    default_fiducial_positions = ["top-left", "top-right", "bottom-left"]
+
+    tooling_positions = normalize_positions(
+        tooling_hole_rule.get("positions"),
+        default_tooling_positions,
+        tooling_hole_count
+    )
+
+    fiducial_positions = normalize_positions(
+        fiducial_rule.get("positions"),
+        default_fiducial_positions,
+        fiducial_count
+    )
+
+    tooling_holes = []
+    for index, position in enumerate(tooling_positions):
+        x, y = position_to_xy(position, panel_w, panel_h, tooling_margin)
+        tooling_holes.append({
+            "name": f"TH{index + 1}",
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "diameter_mm": tooling_hole_diameter_mm,
+            "radius_mm": tooling_hole_radius_mm,
+            "location": position
+        })
+
+    fiducials = []
+    for index, position in enumerate(fiducial_positions):
+        x, y = position_to_xy(position, panel_w, panel_h, fiducial_margin)
+        fiducials.append({
+            "name": f"FD{index + 1}",
+            "x": round(x, 3),
+            "y": round(y, 3),
             "diameter_mm": fiducial_diameter_mm,
             "radius_mm": fiducial_radius_mm,
-            "location": "top-left"
-        },
-        {
-            "name": "FD2",
-            "x": round(panel_w - fiducial_margin, 3),
-            "y": round(panel_h - fiducial_margin, 3),
-            "diameter_mm": fiducial_diameter_mm,
-            "radius_mm": fiducial_radius_mm,
-            "location": "top-right"
-        },
-        {
-            "name": "FD3",
-            "x": round(fiducial_margin, 3),
-            "y": round(fiducial_margin, 3),
-            "diameter_mm": fiducial_diameter_mm,
-            "radius_mm": fiducial_radius_mm,
-            "location": "bottom-left"
-        }
-    ]
+            "location": position
+        })
+
+    rule_version = "strategy_json_panel_feature_rule" if strategy else "panel_feature_rule_v1"
+
+    rule_summary = (
+        f"Fiducial 採 {len(fiducials)} 點配置，Tooling Hole 採 {len(tooling_holes)} 點配置。"
+        f"Fiducial 直徑 {fiducial_diameter_mm:.1f} mm，"
+        f"Tooling Hole 直徑 {tooling_hole_diameter_mm:.1f} mm。"
+    )
+
+    if strategy:
+        rule_summary = "依 strategy_json / 知識庫策略產生：" + rule_summary
+    else:
+        rule_summary = "依內建保守規則產生：" + rule_summary
 
     return {
-        "rule_version": "panel_feature_rule_v1",
+        "rule_version": rule_version,
+        "strategy_used": bool(strategy),
         "fiducials": fiducials,
         "tooling_holes": tooling_holes,
         "fiducial_count": len(fiducials),
         "tooling_hole_count": len(tooling_holes),
         "fiducial_diameter_mm": fiducial_diameter_mm,
         "tooling_hole_diameter_mm": tooling_hole_diameter_mm,
+        "fiducial_rule_from_strategy": fiducial_rule,
+        "tooling_hole_rule_from_strategy": tooling_hole_rule,
         "warnings": warnings,
         "notes": notes,
-        "rule_summary": (
-            f"Fiducial 採 3 點配置，Tooling Hole 採 4 角配置。"
-            f"Fiducial 直徑 {fiducial_diameter_mm:.1f} mm，"
-            f"Tooling Hole 直徑 {tooling_hole_diameter_mm:.1f} mm。"
-        )
+        "rule_summary": rule_summary
     }
 
 
@@ -973,7 +1242,8 @@ def create_real_panel_dxf_from_source(
     has_bga_qfn: bool = False,
     has_dip: bool = False,
     has_heavy_component: bool = False,
-    is_irregular_shape: bool = False
+    is_irregular_shape: bool = False,
+    strategy: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
 
     doc = ezdxf.readfile(source_path)
@@ -1007,17 +1277,13 @@ def create_real_panel_dxf_from_source(
 
     split_method = str(candidate.get("split_method", "V-cut"))
 
-    if "Router" in split_method or "Tab" in split_method:
-        gap_x = float(candidate.get("gap_x_mm", 2.0))
-        gap_y = float(candidate.get("gap_y_mm", 2.0))
-    else:
-        gap_x = float(candidate.get("gap_x_mm", 0.0))
-        gap_y = float(candidate.get("gap_y_mm", 0.0))
+    gap_x = float(candidate.get("gap_x_mm", 0.0))
+    gap_y = float(candidate.get("gap_y_mm", 0.0))
 
-    rail_left = rail_width
-    rail_right = rail_width
-    rail_bottom = rail_width
-    rail_top = rail_width
+    rail_left = float(candidate.get("rail_left_mm", rail_width))
+    rail_right = float(candidate.get("rail_right_mm", rail_width))
+    rail_top = float(candidate.get("rail_top_mm", rail_width))
+    rail_bottom = float(candidate.get("rail_bottom_mm", rail_width))
 
     pitch_x = board_w + gap_x
     pitch_y = board_h + gap_y
@@ -1121,14 +1387,15 @@ def create_real_panel_dxf_from_source(
     feature_result = auto_determine_panel_features(
         panel_w=panel_w,
         panel_h=panel_h,
-        rail_width=rail_width,
+        rail_width=min(rail_left, rail_right, rail_top, rail_bottom),
         columns=columns,
         rows=rows,
         split_method=split_method,
         has_bga_qfn=has_bga_qfn,
         has_dip=has_dip,
         has_heavy_component=has_heavy_component,
-        is_irregular_shape=is_irregular_shape
+        is_irregular_shape=is_irregular_shape,
+        strategy=strategy
     )
 
     draw_panel_features(
@@ -1188,9 +1455,18 @@ def create_real_panel_dxf_from_source(
 
     add_text(
         msp,
-        "AI suggested DXF. ME/CAM confirmation required before production.",
+        f"Strategy used: {bool(strategy)}",
         0,
         text_y - 20,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        "AI suggested DXF. ME/CAM confirmation required before production.",
+        0,
+        text_y - 24,
         2.5,
         "PANEL_TEXT"
     )
@@ -1264,7 +1540,8 @@ def create_simple_panel_dxf_fallback(
     has_bga_qfn: bool = False,
     has_dip: bool = False,
     has_heavy_component: bool = False,
-    is_irregular_shape: bool = False
+    is_irregular_shape: bool = False,
+    strategy: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
 
     doc = ezdxf.new("R2010")
@@ -1272,6 +1549,7 @@ def create_simple_panel_dxf_fallback(
 
     ensure_layer(doc, "PANEL_OUTLINE", 3)
     ensure_layer(doc, "PANEL_VCUT", 1)
+    ensure_layer(doc, "PANEL_ROUTE", 2)
     ensure_layer(doc, "PANEL_TOOLING", 5)
     ensure_layer(doc, "PANEL_FIDUCIAL", 6)
     ensure_layer(doc, "PANEL_TEXT", 7)
@@ -1282,8 +1560,13 @@ def create_simple_panel_dxf_fallback(
     gap_x = float(candidate.get("gap_x_mm", 0.0))
     gap_y = float(candidate.get("gap_y_mm", 0.0))
 
-    panel_w = rail_width * 2 + single_board_length * columns + gap_x * max(columns - 1, 0)
-    panel_h = rail_width * 2 + single_board_width * rows + gap_y * max(rows - 1, 0)
+    rail_left = float(candidate.get("rail_left_mm", rail_width))
+    rail_right = float(candidate.get("rail_right_mm", rail_width))
+    rail_top = float(candidate.get("rail_top_mm", rail_width))
+    rail_bottom = float(candidate.get("rail_bottom_mm", rail_width))
+
+    panel_w = rail_left + rail_right + single_board_length * columns + gap_x * max(columns - 1, 0)
+    panel_h = rail_top + rail_bottom + single_board_width * rows + gap_y * max(rows - 1, 0)
 
     pitch_x = single_board_length + gap_x
     pitch_y = single_board_width + gap_y
@@ -1292,29 +1575,55 @@ def create_simple_panel_dxf_fallback(
 
     for row in range(rows):
         for col in range(columns):
-            x = rail_width + col * pitch_x
-            y = rail_width + row * pitch_y
+            x = rail_left + col * pitch_x
+            y = rail_bottom + row * pitch_y
             add_lwpolyline_rect(msp, x, y, single_board_length, single_board_width, "PANEL_OUTLINE")
 
-    for col in range(1, columns):
-        x = rail_width + col * single_board_length + (col - 0.5) * gap_x
-        add_line(msp, x, rail_width, x, panel_h - rail_width, "PANEL_VCUT")
+    split_method = candidate.get("split_method", "V-cut")
 
-    for row in range(1, rows):
-        y = rail_width + row * single_board_width + (row - 0.5) * gap_y
-        add_line(msp, rail_width, y, panel_w - rail_width, y, "PANEL_VCUT")
+    if "V-cut" in split_method or "V-CUT" in split_method or split_method == "V-cut":
+        for col in range(1, columns):
+            x = rail_left + col * single_board_length + (col - 0.5) * gap_x
+            add_line(msp, x, rail_bottom, x, panel_h - rail_top, "PANEL_VCUT")
+
+        for row in range(1, rows):
+            y = rail_bottom + row * single_board_width + (row - 0.5) * gap_y
+            add_line(msp, rail_left, y, panel_w - rail_right, y, "PANEL_VCUT")
+    else:
+        for col in range(1, columns):
+            x1 = rail_left + col * single_board_length + (col - 1) * gap_x
+            add_lwpolyline_rect(
+                msp,
+                x1,
+                rail_bottom,
+                max(gap_x, 0.3),
+                panel_h - rail_top - rail_bottom,
+                "PANEL_ROUTE"
+            )
+
+        for row in range(1, rows):
+            y1 = rail_bottom + row * single_board_width + (row - 1) * gap_y
+            add_lwpolyline_rect(
+                msp,
+                rail_left,
+                y1,
+                panel_w - rail_left - rail_right,
+                max(gap_y, 0.3),
+                "PANEL_ROUTE"
+            )
 
     feature_result = auto_determine_panel_features(
         panel_w=panel_w,
         panel_h=panel_h,
-        rail_width=rail_width,
+        rail_width=min(rail_left, rail_right, rail_top, rail_bottom),
         columns=columns,
         rows=rows,
-        split_method=candidate.get("split_method", "V-cut"),
+        split_method=split_method,
         has_bga_qfn=has_bga_qfn,
         has_dip=has_dip,
         has_heavy_component=has_heavy_component,
-        is_irregular_shape=is_irregular_shape
+        is_irregular_shape=is_irregular_shape,
+        strategy=strategy
     )
 
     draw_panel_features(
@@ -1328,7 +1637,8 @@ def create_simple_panel_dxf_fallback(
     add_text(msp, f"Product: {product_name}", 0, panel_h + 8, 2.5, "PANEL_TEXT")
     add_text(msp, f"Panel: {columns} x {rows}, {columns * rows} pcs", 0, panel_h + 4, 2.5, "PANEL_TEXT")
     add_text(msp, f"Fiducial: {feature_result.get('fiducial_count')} pcs, Tooling Hole: {feature_result.get('tooling_hole_count')} pcs", 0, panel_h, 2.5, "PANEL_TEXT")
-    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h - 4, 2.5, "PANEL_TEXT")
+    add_text(msp, f"Strategy used: {bool(strategy)}", 0, panel_h - 4, 2.5, "PANEL_TEXT")
+    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h - 8, 2.5, "PANEL_TEXT")
 
     doc.saveas(output_path)
 
@@ -1342,7 +1652,11 @@ def create_simple_panel_dxf_fallback(
         "pcs_per_panel": columns * rows,
         "gap_x_mm": gap_x,
         "gap_y_mm": gap_y,
-        "split_method": candidate.get("split_method", "V-cut"),
+        "rail_left_mm": rail_left,
+        "rail_right_mm": rail_right,
+        "rail_top_mm": rail_top,
+        "rail_bottom_mm": rail_bottom,
+        "split_method": split_method,
         "panel_features": feature_result,
         "fallback": True
     }
@@ -1352,7 +1666,10 @@ def create_simple_panel_dxf_fallback(
 # 本地保險產出：即使 Dify 失敗也能產出真實連版 DXF
 # =========================================================
 
-def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any]:
+def generate_local_panelization_outputs(
+    inputs: Dict[str, str],
+    strategy_json: str = ""
+) -> Dict[str, Any]:
     object_key = str(inputs.get("object_key", ""))
     product_name = str(inputs.get("product_name", "UNKNOWN"))
 
@@ -1368,6 +1685,9 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
     has_dip = yes_no_to_bool(inputs.get("has_dip", "No"))
     has_heavy_component = yes_no_to_bool(inputs.get("has_heavy_component", "No"))
     is_irregular_shape = yes_no_to_bool(inputs.get("is_irregular_shape", "No"))
+
+    strategy, strategy_parse_error = parse_strategy_json(strategy_json)
+    strategy_applied = bool(strategy)
 
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_source.dxf")
     download_file_from_minio(object_key, local_input)
@@ -1406,7 +1726,18 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         is_irregular_shape
     )
 
-    candidate = result["best_candidate"]
+    base_candidate = result["best_candidate"]
+
+    candidate = apply_strategy_to_candidate(
+        base_candidate=base_candidate,
+        strategy=strategy,
+        board_w=detected_length,
+        board_h=detected_width,
+        default_rail_width=rail_width
+    )
+
+    if strategy:
+        result = update_result_with_strategy_candidate(result, candidate)
 
     safe_name = safe_filename_name(product_name)
     output_name = f"panelized_{safe_name}_{candidate['panel_type']}_real.dxf"
@@ -1426,7 +1757,8 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
             has_bga_qfn=has_bga_qfn,
             has_dip=has_dip,
             has_heavy_component=has_heavy_component,
-            is_irregular_shape=is_irregular_shape
+            is_irregular_shape=is_irregular_shape,
+            strategy=strategy
         )
         geometry_mode = "real_source_dxf_copied"
 
@@ -1441,7 +1773,8 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
             has_bga_qfn=has_bga_qfn,
             has_dip=has_dip,
             has_heavy_component=has_heavy_component,
-            is_irregular_shape=is_irregular_shape
+            is_irregular_shape=is_irregular_shape,
+            strategy=strategy
         )
         geometry_info["real_dxf_error"] = str(e)
         geometry_mode = "simple_fallback"
@@ -1483,14 +1816,21 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "display_candidates": result["display_candidates"],
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
-        "message": "Panelized DXF generated by real DXF panelization engine with auto Fiducial and Tooling Hole placement."
+        "strategy_applied": strategy_applied,
+        "strategy_source": get_strategy_source(strategy),
+        "strategy_json": strategy,
+        "strategy_parse_error": strategy_parse_error,
+        "message": "Panelized DXF generated by real DXF panelization engine with strategy_json support."
     }
 
     report_text = build_ai_report_markdown(
         product_name=product_name,
         object_key=object_key,
         result=result,
-        panel_dxf=panel_dxf
+        panel_dxf=panel_dxf,
+        strategy=strategy,
+        strategy_applied=strategy_applied,
+        strategy_parse_error=strategy_parse_error
     )
 
     return {
@@ -1507,7 +1847,11 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
         "geometry_info": geometry_info,
-        "geometry_mode": geometry_mode
+        "geometry_mode": geometry_mode,
+        "strategy_applied": strategy_applied,
+        "strategy_source": get_strategy_source(strategy),
+        "strategy_json": strategy,
+        "strategy_parse_error": strategy_parse_error
     }
 
 
@@ -1542,6 +1886,10 @@ def merge_local_outputs_into_dify_result(
     outputs["geometry_mode"] = local_outputs["geometry_mode"]
     outputs["geometry_info"] = local_outputs["geometry_info"]
     outputs["display_candidates"] = local_outputs["display_candidates"]
+    outputs["strategy_applied"] = local_outputs["strategy_applied"]
+    outputs["strategy_source"] = local_outputs["strategy_source"]
+    outputs["strategy_json"] = local_outputs["strategy_json"]
+    outputs["strategy_parse_error"] = local_outputs["strategy_parse_error"]
 
     dify_result["data"]["outputs"] = outputs
 
@@ -1709,7 +2057,8 @@ async def generate_panel_dxf_from_minio(
     has_bga_qfn: str = Form("No"),
     has_dip: str = Form("No"),
     has_heavy_component: str = Form("No"),
-    is_irregular_shape: str = Form("No")
+    is_irregular_shape: str = Form("No"),
+    strategy_json: str = Form("")
 ):
     inputs = {
         "object_key": object_key,
@@ -1727,7 +2076,7 @@ async def generate_panel_dxf_from_minio(
         "is_irregular_shape": is_irregular_shape
     }
 
-    outputs = generate_local_panelization_outputs(inputs)
+    outputs = generate_local_panelization_outputs(inputs, strategy_json=strategy_json)
     return outputs["panel_dxf"]
 
 
@@ -1766,7 +2115,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     local_outputs = None
 
     try:
-        local_outputs = generate_local_panelization_outputs(inputs)
+        local_outputs = generate_local_panelization_outputs(inputs, strategy_json="")
 
         if not DIFY_API_BASE or not DIFY_API_KEY:
             fallback_result = {
@@ -1783,7 +2132,11 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
                         "geometry_info": local_outputs["geometry_info"],
-                        "display_candidates": local_outputs["display_candidates"]
+                        "display_candidates": local_outputs["display_candidates"],
+                        "strategy_applied": local_outputs["strategy_applied"],
+                        "strategy_source": local_outputs["strategy_source"],
+                        "strategy_json": local_outputs["strategy_json"],
+                        "strategy_parse_error": local_outputs["strategy_parse_error"]
                     },
                     "warning": "Dify API environment variables are not configured, but local real DXF generation succeeded."
                 }
@@ -1845,7 +2198,11 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
                         "geometry_info": local_outputs["geometry_info"],
-                        "display_candidates": local_outputs["display_candidates"]
+                        "display_candidates": local_outputs["display_candidates"],
+                        "strategy_applied": local_outputs["strategy_applied"],
+                        "strategy_source": local_outputs["strategy_source"],
+                        "strategy_json": local_outputs["strategy_json"],
+                        "strategy_parse_error": local_outputs["strategy_parse_error"]
                     },
                     "warning": "Dify workflow API failed, but local real DXF generation succeeded.",
                     "dify_error": response.text
@@ -1876,7 +2233,11 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
                         "geometry_info": local_outputs["geometry_info"],
-                        "display_candidates": local_outputs["display_candidates"]
+                        "display_candidates": local_outputs["display_candidates"],
+                        "strategy_applied": local_outputs["strategy_applied"],
+                        "strategy_source": local_outputs["strategy_source"],
+                        "strategy_json": local_outputs["strategy_json"],
+                        "strategy_parse_error": local_outputs["strategy_parse_error"]
                     },
                     "warning": "Dify returned non-JSON response, but local real DXF generation succeeded.",
                     "dify_response_preview": response.text[:1500]
@@ -1921,6 +2282,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
 
 # =========================================================
 # API：開始 Dify 背景任務
+# upload.html 會呼叫這支
 # =========================================================
 
 @app.post("/api/pcb/start-dify-job")
@@ -1994,7 +2356,7 @@ def get_job_status(job_id: str):
 
 
 # =========================================================
-# 舊版同步 API：現在也會產出真實連版 DXF
+# 舊版同步 API：現在也支援 strategy_json
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
@@ -2011,7 +2373,8 @@ async def run_dify_panelization(
     has_bga_qfn: str = Form("No"),
     has_dip: str = Form("No"),
     has_heavy_component: str = Form("No"),
-    is_irregular_shape: str = Form("No")
+    is_irregular_shape: str = Form("No"),
+    strategy_json: str = Form("")
 ):
     inputs = {
         "object_key": object_key,
@@ -2029,11 +2392,11 @@ async def run_dify_panelization(
         "is_irregular_shape": is_irregular_shape
     }
 
-    local_outputs = generate_local_panelization_outputs(inputs)
+    local_outputs = generate_local_panelization_outputs(inputs, strategy_json=strategy_json)
 
     return {
         "status": "success",
-        "message": "Synchronous API used real DXF panelization output.",
+        "message": "Synchronous API used real DXF panelization output with strategy_json support.",
         "data": {
             "outputs": {
                 "report_text": local_outputs["report_text"],
@@ -2044,7 +2407,11 @@ async def run_dify_panelization(
                 "fallback_download_url": local_outputs["download_url"],
                 "geometry_mode": local_outputs["geometry_mode"],
                 "geometry_info": local_outputs["geometry_info"],
-                "display_candidates": local_outputs["display_candidates"]
+                "display_candidates": local_outputs["display_candidates"],
+                "strategy_applied": local_outputs["strategy_applied"],
+                "strategy_source": local_outputs["strategy_source"],
+                "strategy_json": local_outputs["strategy_json"],
+                "strategy_parse_error": local_outputs["strategy_parse_error"]
             }
         }
     }
