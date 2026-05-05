@@ -15,7 +15,7 @@
     }
 
     .container {
-      max-width: 920px;
+      max-width: 1100px;
       margin: 48px auto;
       background: #ffffff;
       padding: 36px;
@@ -335,15 +335,100 @@
 
     .report-box {
       margin-top: 20px;
-      padding: 20px;
+      padding: 22px;
       border-radius: 14px;
       background: #ffffff;
       border: 1px solid #d1fae5;
       color: #111827;
-      white-space: pre-wrap;
-      line-height: 1.7;
-      max-height: 520px;
+      line-height: 1.8;
+      max-height: 720px;
       overflow: auto;
+    }
+
+    .markdown-body h1 {
+      font-size: 26px;
+      margin: 18px 0 16px;
+      color: #111827;
+      border-bottom: 2px solid #e5e7eb;
+      padding-bottom: 8px;
+    }
+
+    .markdown-body h2 {
+      font-size: 21px;
+      margin: 24px 0 12px;
+      color: #1f2937;
+      border-left: 5px solid #2563eb;
+      padding-left: 10px;
+      background: #eff6ff;
+      padding-top: 8px;
+      padding-bottom: 8px;
+      border-radius: 8px;
+    }
+
+    .markdown-body h3 {
+      font-size: 18px;
+      margin: 18px 0 10px;
+      color: #374151;
+    }
+
+    .markdown-body p {
+      margin: 8px 0;
+    }
+
+    .markdown-body ul {
+      margin: 8px 0 16px 22px;
+      padding: 0;
+    }
+
+    .markdown-body li {
+      margin: 6px 0;
+    }
+
+    .markdown-body .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      margin: 14px 0 20px;
+      border: 1px solid #d1d5db;
+      border-radius: 12px;
+      background: #ffffff;
+    }
+
+    .markdown-body table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 980px;
+      font-size: 14px;
+    }
+
+    .markdown-body th {
+      background: #1f2937;
+      color: #ffffff;
+      text-align: left;
+      padding: 10px 12px;
+      border: 1px solid #374151;
+      white-space: nowrap;
+    }
+
+    .markdown-body td {
+      padding: 10px 12px;
+      border: 1px solid #e5e7eb;
+      vertical-align: top;
+      word-break: break-word;
+    }
+
+    .markdown-body tr:nth-child(even) td {
+      background: #f9fafb;
+    }
+
+    .markdown-body tr:hover td {
+      background: #eff6ff;
+    }
+
+    .markdown-body code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #b91c1c;
     }
 
     .raw-box {
@@ -383,6 +468,10 @@
       .copy-row {
         flex-direction: column;
         align-items: stretch;
+      }
+
+      .markdown-body table {
+        min-width: 900px;
       }
     }
   </style>
@@ -570,7 +659,7 @@
 
       <div class="field">
         <div class="label">PCB 連版規劃 AI 建議報告</div>
-        <div id="reportText" class="report-box"></div>
+        <div id="reportText" class="report-box markdown-body"></div>
       </div>
 
       <details>
@@ -813,7 +902,7 @@
         extractAnyText(difyResult) ||
         "未找到報告文字。請檢查 Dify End 節點是否有輸出 report_text。";
 
-      document.getElementById("reportText").innerText = reportText;
+      document.getElementById("reportText").innerHTML = markdownToHtml(reportText);
 
       const dxfInfo = extractDxfInfo(outputs, difyResult);
 
@@ -940,6 +1029,163 @@
       }
 
       return "";
+    }
+
+    function markdownToHtml(markdown) {
+      if (!markdown) return "";
+
+      const lines = markdown.split(/\r?\n/);
+      let html = "";
+      let i = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        if (isMarkdownTableStart(lines, i)) {
+          const tableData = collectMarkdownTable(lines, i);
+          html += renderMarkdownTable(tableData.rows);
+          i = tableData.nextIndex;
+          continue;
+        }
+
+        if (line.startsWith("# ")) {
+          html += "<h1>" + escapeHtml(line.replace(/^# /, "")) + "</h1>";
+        } else if (line.startsWith("## ")) {
+          html += "<h2>" + escapeHtml(line.replace(/^## /, "")) + "</h2>";
+        } else if (line.startsWith("### ")) {
+          html += "<h3>" + escapeHtml(line.replace(/^### /, "")) + "</h3>";
+        } else if (line.trim().startsWith("- ")) {
+          const listData = collectList(lines, i);
+          html += renderList(listData.items);
+          i = listData.nextIndex;
+          continue;
+        } else if (line.trim() === "") {
+          html += "";
+        } else {
+          html += "<p>" + inlineFormat(escapeHtml(line)) + "</p>";
+        }
+
+        i++;
+      }
+
+      return html;
+    }
+
+    function isMarkdownTableStart(lines, index) {
+      if (index + 1 >= lines.length) return false;
+
+      const header = lines[index].trim();
+      const separator = lines[index + 1].trim();
+
+      return header.startsWith("|") &&
+             header.endsWith("|") &&
+             separator.startsWith("|") &&
+             separator.includes("---");
+    }
+
+    function collectMarkdownTable(lines, index) {
+      const rows = [];
+      let i = index;
+
+      while (i < lines.length) {
+        const line = lines[i].trim();
+
+        if (!line.startsWith("|") || !line.endsWith("|")) {
+          break;
+        }
+
+        rows.push(line);
+        i++;
+      }
+
+      return {
+        rows: rows,
+        nextIndex: i
+      };
+    }
+
+    function renderMarkdownTable(rows) {
+      if (rows.length < 2) return "";
+
+      const headerCells = splitTableRow(rows[0]);
+      const bodyRows = rows.slice(2);
+
+      let html = '<div class="table-wrap"><table><thead><tr>';
+
+      for (const cell of headerCells) {
+        html += "<th>" + inlineFormat(escapeHtml(cell.trim())) + "</th>";
+      }
+
+      html += "</tr></thead><tbody>";
+
+      for (const row of bodyRows) {
+        const cells = splitTableRow(row);
+        html += "<tr>";
+
+        for (let i = 0; i < headerCells.length; i++) {
+          html += "<td>" + inlineFormat(escapeHtml((cells[i] || "").trim())) + "</td>";
+        }
+
+        html += "</tr>";
+      }
+
+      html += "</tbody></table></div>";
+      return html;
+    }
+
+    function splitTableRow(row) {
+      let cleaned = row.trim();
+
+      if (cleaned.startsWith("|")) cleaned = cleaned.substring(1);
+      if (cleaned.endsWith("|")) cleaned = cleaned.substring(0, cleaned.length - 1);
+
+      return cleaned.split("|").map(function (cell) {
+        return cell.trim();
+      });
+    }
+
+    function collectList(lines, index) {
+      const items = [];
+      let i = index;
+
+      while (i < lines.length && lines[i].trim().startsWith("- ")) {
+        items.push(lines[i].trim().replace(/^- /, ""));
+        i++;
+      }
+
+      return {
+        items: items,
+        nextIndex: i
+      };
+    }
+
+    function renderList(items) {
+      let html = "<ul>";
+
+      for (const item of items) {
+        html += "<li>" + inlineFormat(escapeHtml(item)) + "</li>";
+      }
+
+      html += "</ul>";
+      return html;
+    }
+
+    function inlineFormat(text) {
+      let output = text;
+
+      output = output.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+      output = output.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+      return output;
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
     }
 
     function findUrl(text) {
