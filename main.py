@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import os
 import tempfile
 import uuid
@@ -12,6 +12,10 @@ import traceback
 
 from minio import Minio
 from minio.error import S3Error
+
+import ezdxf
+from ezdxf import bbox
+from ezdxf.math import Matrix44
 
 
 app = FastAPI(title="PCB Panelization API", version="0.8.0-minio-dify-async-job")
@@ -46,7 +50,7 @@ DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
 
 # =========================================================
 # 背景任務暫存
-# 注意：這是 MVP 版本，服務重啟後 job 記錄會消失
+# 注意：MVP 版本，服務重啟後 job 記錄會消失
 # =========================================================
 
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
@@ -83,6 +87,13 @@ def safe_filename_name(filename: str) -> str:
         .replace("/", "_")
         .replace("\\", "_")
         .replace(" ", "_")
+        .replace(":", "_")
+        .replace("*", "_")
+        .replace("?", "_")
+        .replace('"', "_")
+        .replace("<", "_")
+        .replace(">", "_")
+        .replace("|", "_")
     )
 
 
@@ -114,6 +125,10 @@ def reasons_to_text(reasons: List[str]) -> str:
     if not reasons:
         return "符合目前尺寸與製程限制，無明顯重大風險。"
     return "；".join(reasons)
+
+
+def make_public_api_download_url(object_key: str) -> str:
+    return f"/api/pcb/download?object_key={object_key}"
 
 
 # =========================================================
@@ -220,7 +235,7 @@ def root():
         "service": "PCB Panelization API",
         "version": "0.8.0-minio-dify-async-job",
         "message": "Use /upload for DXF upload page, or /docs for API testing.",
-        "note": "This build includes local DXF fallback when Dify workflow fails or outputs are empty."
+        "important_note": "This version includes real DXF panelization by reading source DXF entities with ezdxf."
     }
 
 
@@ -277,7 +292,7 @@ def health_dify():
 
 
 # =========================================================
-# 共用：產生連版候選方案
+# 候選方案計算
 # =========================================================
 
 def calculate_candidates(
@@ -310,8 +325,25 @@ def calculate_candidates(
     candidates: List[Dict[str, Any]] = []
 
     for x_count, y_count in panel_patterns:
-        panel_length = single_board_length * x_count + rail_width * 2
-        panel_width = single_board_width * y_count + rail_width * 2
+        if is_irregular_shape:
+            gap_x = 2.0
+            gap_y = 2.0
+        else:
+            gap_x = 0.0
+            gap_y = 0.0
+
+        panel_length = (
+            single_board_length * x_count
+            + gap_x * max(x_count - 1, 0)
+            + rail_width * 2
+        )
+
+        panel_width = (
+            single_board_width * y_count
+            + gap_y * max(y_count - 1, 0)
+            + rail_width * 2
+        )
+
         pcs_per_panel = x_count * y_count
 
         reasons = []
@@ -336,7 +368,7 @@ def calculate_candidates(
                 )
                 risk_score += 30
 
-        aspect_ratio = max(panel_length, panel_width) / min(panel_length, panel_width)
+        aspect_ratio = max(panel_length, panel_width) / max(min(panel_length, panel_width), 0.001)
 
         if aspect_ratio > 3:
             reasons.append(
@@ -376,6 +408,10 @@ def calculate_candidates(
             "panel_type": f"{x_count}x{y_count}",
             "x_count": x_count,
             "y_count": y_count,
+            "columns": x_count,
+            "rows": y_count,
+            "gap_x_mm": gap_x,
+            "gap_y_mm": gap_y,
             "panel_length_mm": round(panel_length, 2),
             "panel_width_mm": round(panel_width, 2),
             "panel_size": f"{panel_length:.1f} x {panel_width:.1f} mm",
@@ -473,11 +509,20 @@ def build_caution_and_not_summary(candidates: List[Dict[str, Any]]) -> str:
 def build_ai_report_markdown(
     product_name: str,
     object_key: str,
-    result: Dict[str, Any]
+    result: Dict[str, Any],
+    panel_dxf: Optional[Dict[str, Any]] = None
 ) -> str:
     best = result["best_candidate"]
     comparison_table = build_comparison_table_markdown(result["all_candidates"])
     caution_text = build_caution_and_not_summary(result["all_candidates"])
+
+    dxf_info = ""
+    if panel_dxf:
+        dxf_info = f"""
+- 輸出 DXF 檔名：{panel_dxf.get("output_filename", "")}
+- 輸出 object_key：{panel_dxf.get("output_object_key", "")}
+- 下載連結：{panel_dxf.get("download_url", "")}
+""".strip()
 
     report = f"""
 # PCB 連版規劃 AI 建議報告
@@ -507,7 +552,11 @@ def build_ai_report_markdown(
 
 {caution_text}
 
-## 五、製程風險提醒
+## 五、DXF 輸出資訊
+
+{dxf_info if dxf_info else "DXF 已由系統產生，請於下載連結取得。"}
+
+## 六、製程風險提醒
 
 - 若有 BGA/QFN，需確認元件距離 V-cut 或 Router 邊界的安全距離。
 - 若有 DIP，需確認波峰焊方向、錫流方向與治具需求。
@@ -515,7 +564,7 @@ def build_ai_report_markdown(
 - 若為異形板，通常不建議直接使用 V-cut，建議優先評估 Router 或 Tab。
 - 若 Panel 尺寸超過 SMT 或 ICT 限制，該方案應列為不建議。
 
-## 六、ME / CAM 最終確認清單
+## 七、ME / CAM 最終確認清單
 
 - 單板尺寸是否正確。
 - Panel 尺寸是否符合 SMT 最大進板限制。
@@ -524,7 +573,7 @@ def build_ai_report_markdown(
 - Fiducial、Tooling Hole、工藝邊寬度是否符合公司規範。
 - 是否需要補強支撐、治具或調整過爐方向。
 
-## 七、輸出限制說明
+## 八、輸出限制說明
 
 本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
 """
@@ -532,197 +581,453 @@ def build_ai_report_markdown(
 
 
 # =========================================================
-# 共用：DXF 產生工具
+# DXF 幾何工具
 # =========================================================
 
-def dxf_header() -> str:
-    return """0
-SECTION
-2
-HEADER
-9
-$ACADVER
-1
-AC1009
-0
-ENDSEC
-0
-SECTION
-2
-TABLES
-0
-TABLE
-2
-LAYER
-70
-5
-0
-LAYER
-2
-BOARD
-70
-0
-62
-7
-6
-CONTINUOUS
-0
-LAYER
-2
-PANEL
-70
-0
-62
-3
-6
-CONTINUOUS
-0
-LAYER
-2
-VCUT
-70
-0
-62
-1
-6
-CONTINUOUS
-0
-LAYER
-2
-TOOLING
-70
-0
-62
-5
-6
-CONTINUOUS
-0
-LAYER
-2
-FIDUCIAL
-70
-0
-62
-2
-6
-CONTINUOUS
-0
-ENDTAB
-0
-ENDSEC
-0
-SECTION
-2
-ENTITIES
-"""
+def get_modelspace_bbox(doc) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        msp = doc.modelspace()
+        ext = bbox.extents(msp, fast=True)
+
+        if not ext.has_data:
+            return None
+
+        min_x = float(ext.extmin.x)
+        min_y = float(ext.extmin.y)
+        max_x = float(ext.extmax.x)
+        max_y = float(ext.extmax.y)
+
+        if max_x <= min_x or max_y <= min_y:
+            return None
+
+        return min_x, min_y, max_x, max_y
+
+    except Exception:
+        return None
 
 
-def dxf_footer() -> str:
-    return """0
-ENDSEC
-0
-EOF
-"""
+def ensure_layer(doc, name: str, color: int = 7):
+    try:
+        if name not in doc.layers:
+            doc.layers.add(name=name, color=color)
+    except Exception:
+        pass
 
 
-def dxf_line(x1: float, y1: float, x2: float, y2: float, layer: str) -> str:
-    return f"""0
-LINE
-8
-{layer}
-10
-{x1:.3f}
-20
-{y1:.3f}
-30
-0.000
-11
-{x2:.3f}
-21
-{y2:.3f}
-31
-0.000
-"""
+def transform_entity_safe(entity, matrix: Matrix44) -> bool:
+    try:
+        entity.transform(matrix)
+        return True
+    except Exception:
+        return False
 
 
-def dxf_circle(x: float, y: float, r: float, layer: str) -> str:
-    return f"""0
-CIRCLE
-8
-{layer}
-10
-{x:.3f}
-20
-{y:.3f}
-30
-0.000
-40
-{r:.3f}
-"""
-
-
-def dxf_rect(x: float, y: float, w: float, h: float, layer: str) -> str:
-    return (
-        dxf_line(x, y, x + w, y, layer)
-        + dxf_line(x + w, y, x + w, y + h, layer)
-        + dxf_line(x + w, y + h, x, y + h, layer)
-        + dxf_line(x, y + h, x, y, layer)
+def add_lwpolyline_rect(msp, x: float, y: float, w: float, h: float, layer: str):
+    msp.add_lwpolyline(
+        [
+            (x, y),
+            (x + w, y),
+            (x + w, y + h),
+            (x, y + h),
+            (x, y),
+        ],
+        dxfattribs={"layer": layer, "closed": True}
     )
 
 
-def create_panel_dxf(
+def add_line(msp, x1: float, y1: float, x2: float, y2: float, layer: str):
+    msp.add_line(
+        (x1, y1),
+        (x2, y2),
+        dxfattribs={"layer": layer}
+    )
+
+
+def add_circle(msp, x: float, y: float, r: float, layer: str):
+    msp.add_circle(
+        center=(x, y),
+        radius=r,
+        dxfattribs={"layer": layer}
+    )
+
+
+def add_text(msp, text: str, x: float, y: float, height: float, layer: str):
+    try:
+        msp.add_text(
+            text,
+            dxfattribs={
+                "layer": layer,
+                "height": height,
+                "insert": (x, y)
+            }
+        )
+    except Exception:
+        pass
+
+
+def create_real_panel_dxf_from_source(
+    source_path: str,
     output_path: str,
     product_name: str,
     single_board_length: float,
     single_board_width: float,
     rail_width: float,
     candidate: Dict[str, Any]
-):
-    x_count = candidate["x_count"]
-    y_count = candidate["y_count"]
-    panel_length = candidate["panel_length_mm"]
-    panel_width = candidate["panel_width_mm"]
+) -> Dict[str, Any]:
 
-    content = dxf_header()
+    doc = ezdxf.readfile(source_path)
+    msp = doc.modelspace()
 
-    content += dxf_rect(0, 0, panel_length, panel_width, "PANEL")
+    ensure_layer(doc, "PANEL_OUTLINE", 3)
+    ensure_layer(doc, "PANEL_VCUT", 1)
+    ensure_layer(doc, "PANEL_ROUTE", 2)
+    ensure_layer(doc, "PANEL_TOOLING", 5)
+    ensure_layer(doc, "PANEL_FIDUCIAL", 6)
+    ensure_layer(doc, "PANEL_TEXT", 7)
+    ensure_layer(doc, "PANEL_DIMENSION", 4)
 
-    for i in range(x_count):
-        for j in range(y_count):
-            x = rail_width + i * single_board_length
-            y = rail_width + j * single_board_width
-            content += dxf_rect(x, y, single_board_length, single_board_width, "BOARD")
+    detected_bbox = get_modelspace_bbox(doc)
 
-    for i in range(1, x_count):
-        x = rail_width + i * single_board_length
-        content += dxf_line(x, rail_width, x, panel_width - rail_width, "VCUT")
+    if detected_bbox:
+        min_x, min_y, max_x, max_y = detected_bbox
+        detected_board_w = max_x - min_x
+        detected_board_h = max_y - min_y
+    else:
+        min_x = 0.0
+        min_y = 0.0
+        detected_board_w = single_board_length
+        detected_board_h = single_board_width
 
-    for j in range(1, y_count):
-        y = rail_width + j * single_board_width
-        content += dxf_line(rail_width, y, panel_length - rail_width, y, "VCUT")
+    board_w = detected_board_w if detected_board_w > 0 else single_board_length
+    board_h = detected_board_h if detected_board_h > 0 else single_board_width
 
-    hole_r = 1.6
-    offset = max(rail_width / 2, 2.5)
+    columns = int(candidate.get("x_count", candidate.get("columns", 1)))
+    rows = int(candidate.get("y_count", candidate.get("rows", 1)))
 
-    content += dxf_circle(offset, offset, hole_r, "TOOLING")
-    content += dxf_circle(panel_length - offset, offset, hole_r, "TOOLING")
-    content += dxf_circle(offset, panel_width - offset, hole_r, "TOOLING")
-    content += dxf_circle(panel_length - offset, panel_width - offset, hole_r, "TOOLING")
+    split_method = str(candidate.get("split_method", "V-cut"))
+
+    if "Router" in split_method or "Tab" in split_method:
+        gap_x = float(candidate.get("gap_x_mm", 2.0))
+        gap_y = float(candidate.get("gap_y_mm", 2.0))
+    else:
+        gap_x = float(candidate.get("gap_x_mm", 0.0))
+        gap_y = float(candidate.get("gap_y_mm", 0.0))
+
+    rail_left = rail_width
+    rail_right = rail_width
+    rail_bottom = rail_width
+    rail_top = rail_width
+
+    pitch_x = board_w + gap_x
+    pitch_y = board_h + gap_y
+
+    panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
+    panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
+
+    source_entities = list(msp)
+
+    # 把原始單板移到第一格位置
+    base_dx = rail_left - min_x
+    base_dy = rail_bottom - min_y
+    base_matrix = Matrix44.translate(base_dx, base_dy, 0)
+
+    for entity in source_entities:
+        transform_entity_safe(entity, base_matrix)
+
+    # 複製到其他格
+    for row in range(rows):
+        for col in range(columns):
+            if row == 0 and col == 0:
+                continue
+
+            dx = col * pitch_x
+            dy = row * pitch_y
+            copy_matrix = Matrix44.translate(dx, dy, 0)
+
+            for entity in source_entities:
+                try:
+                    copied = entity.copy()
+                    transform_entity_safe(copied, copy_matrix)
+                    msp.add_entity(copied)
+                except Exception:
+                    continue
+
+    # Panel 外框
+    add_lwpolyline_rect(
+        msp,
+        0,
+        0,
+        panel_w,
+        panel_h,
+        "PANEL_OUTLINE"
+    )
+
+    # 每片板外框輔助線
+    for row in range(rows):
+        for col in range(columns):
+            x = rail_left + col * pitch_x
+            y = rail_bottom + row * pitch_y
+            add_lwpolyline_rect(
+                msp,
+                x,
+                y,
+                board_w,
+                board_h,
+                "PANEL_OUTLINE"
+            )
+
+    # 分板線
+    if "V-cut" in split_method or "V-CUT" in split_method or "V" in split_method:
+        for col in range(1, columns):
+            x = rail_left + col * board_w + (col - 0.5) * gap_x
+            add_line(
+                msp,
+                x,
+                rail_bottom,
+                x,
+                panel_h - rail_top,
+                "PANEL_VCUT"
+            )
+
+        for row in range(1, rows):
+            y = rail_bottom + row * board_h + (row - 0.5) * gap_y
+            add_line(
+                msp,
+                rail_left,
+                y,
+                panel_w - rail_right,
+                y,
+                "PANEL_VCUT"
+            )
+    else:
+        for col in range(1, columns):
+            x1 = rail_left + col * board_w + (col - 1) * gap_x
+            x2 = x1 + gap_x
+            add_lwpolyline_rect(
+                msp,
+                x1,
+                rail_bottom,
+                max(gap_x, 0.3),
+                panel_h - rail_top - rail_bottom,
+                "PANEL_ROUTE"
+            )
+
+        for row in range(1, rows):
+            y1 = rail_bottom + row * board_h + (row - 1) * gap_y
+            add_lwpolyline_rect(
+                msp,
+                rail_left,
+                y1,
+                panel_w - rail_left - rail_right,
+                max(gap_y, 0.3),
+                "PANEL_ROUTE"
+            )
+
+    # Tooling holes
+    tooling_r = 1.6
+    tooling_margin = max(rail_width / 2.0, 2.5)
+
+    add_circle(msp, tooling_margin, tooling_margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, panel_w - tooling_margin, tooling_margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, panel_w - tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
+
+    # Fiducial
+    fid_r = 0.75
+    fid_margin = max(rail_width, 3.0)
+
+    add_circle(msp, fid_margin, panel_h - fid_margin, fid_r, "PANEL_FIDUCIAL")
+    add_circle(msp, panel_w - fid_margin, panel_h - fid_margin, fid_r, "PANEL_FIDUCIAL")
+    add_circle(msp, fid_margin, fid_margin, fid_r, "PANEL_FIDUCIAL")
+
+    # 文字說明
+    text_y = panel_h + 8
+    add_text(
+        msp,
+        f"Product: {product_name}",
+        0,
+        text_y,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        f"One piece: {board_w:.2f} x {board_h:.2f} mm",
+        0,
+        text_y - 4,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        f"Panel size: {panel_w:.2f} x {panel_h:.2f} mm",
+        0,
+        text_y - 8,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        f"{columns * rows} pcs/panel, Layout: {columns} x {rows}, Split: {split_method}",
+        0,
+        text_y - 12,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        "AI suggested DXF. ME/CAM confirmation required before production.",
+        0,
+        text_y - 16,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    # 簡易尺寸線
+    dim_offset = 6.0
+
+    add_line(
+        msp,
+        0,
+        -dim_offset,
+        panel_w,
+        -dim_offset,
+        "PANEL_DIMENSION"
+    )
+
+    add_line(
+        msp,
+        -dim_offset,
+        0,
+        -dim_offset,
+        panel_h,
+        "PANEL_DIMENSION"
+    )
+
+    add_text(
+        msp,
+        f"{panel_w:.2f}",
+        panel_w / 2.0,
+        -dim_offset - 3,
+        2.0,
+        "PANEL_DIMENSION"
+    )
+
+    add_text(
+        msp,
+        f"{panel_h:.2f}",
+        -dim_offset - 8,
+        panel_h / 2.0,
+        2.0,
+        "PANEL_DIMENSION"
+    )
+
+    doc.saveas(output_path)
+
+    return {
+        "detected_board_width_mm": round(board_w, 3),
+        "detected_board_height_mm": round(board_h, 3),
+        "panel_width_mm": round(panel_w, 3),
+        "panel_height_mm": round(panel_h, 3),
+        "columns": columns,
+        "rows": rows,
+        "pcs_per_panel": columns * rows,
+        "gap_x_mm": gap_x,
+        "gap_y_mm": gap_y,
+        "rail_left_mm": rail_left,
+        "rail_right_mm": rail_right,
+        "rail_top_mm": rail_top,
+        "rail_bottom_mm": rail_bottom,
+        "split_method": split_method
+    }
+
+
+def create_simple_panel_dxf_fallback(
+    output_path: str,
+    product_name: str,
+    single_board_length: float,
+    single_board_width: float,
+    rail_width: float,
+    candidate: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+
+    ensure_layer(doc, "PANEL_OUTLINE", 3)
+    ensure_layer(doc, "PANEL_VCUT", 1)
+    ensure_layer(doc, "PANEL_TOOLING", 5)
+    ensure_layer(doc, "PANEL_FIDUCIAL", 6)
+    ensure_layer(doc, "PANEL_TEXT", 7)
+
+    columns = int(candidate.get("x_count", 1))
+    rows = int(candidate.get("y_count", 1))
+
+    gap_x = float(candidate.get("gap_x_mm", 0.0))
+    gap_y = float(candidate.get("gap_y_mm", 0.0))
+
+    panel_w = rail_width * 2 + single_board_length * columns + gap_x * max(columns - 1, 0)
+    panel_h = rail_width * 2 + single_board_width * rows + gap_y * max(rows - 1, 0)
+
+    pitch_x = single_board_length + gap_x
+    pitch_y = single_board_width + gap_y
+
+    add_lwpolyline_rect(msp, 0, 0, panel_w, panel_h, "PANEL_OUTLINE")
+
+    for row in range(rows):
+        for col in range(columns):
+            x = rail_width + col * pitch_x
+            y = rail_width + row * pitch_y
+            add_lwpolyline_rect(msp, x, y, single_board_length, single_board_width, "PANEL_OUTLINE")
+
+    for col in range(1, columns):
+        x = rail_width + col * single_board_length + (col - 0.5) * gap_x
+        add_line(msp, x, rail_width, x, panel_h - rail_width, "PANEL_VCUT")
+
+    for row in range(1, rows):
+        y = rail_width + row * single_board_width + (row - 0.5) * gap_y
+        add_line(msp, rail_width, y, panel_w - rail_width, y, "PANEL_VCUT")
+
+    tooling_r = 1.6
+    margin = max(rail_width / 2.0, 2.5)
+
+    add_circle(msp, margin, margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, panel_w - margin, margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, margin, panel_h - margin, tooling_r, "PANEL_TOOLING")
+    add_circle(msp, panel_w - margin, panel_h - margin, tooling_r, "PANEL_TOOLING")
 
     fid_r = 0.75
+    add_circle(msp, rail_width, rail_width, fid_r, "PANEL_FIDUCIAL")
+    add_circle(msp, panel_w - rail_width, rail_width, fid_r, "PANEL_FIDUCIAL")
+    add_circle(msp, rail_width, panel_h - rail_width, fid_r, "PANEL_FIDUCIAL")
 
-    content += dxf_circle(rail_width, rail_width, fid_r, "FIDUCIAL")
-    content += dxf_circle(panel_length - rail_width, rail_width, fid_r, "FIDUCIAL")
-    content += dxf_circle(rail_width, panel_width - rail_width, fid_r, "FIDUCIAL")
+    add_text(msp, f"Product: {product_name}", 0, panel_h + 8, 2.5, "PANEL_TEXT")
+    add_text(msp, f"Panel: {columns} x {rows}, {columns * rows} pcs", 0, panel_h + 4, 2.5, "PANEL_TEXT")
+    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h, 2.5, "PANEL_TEXT")
 
-    content += dxf_footer()
+    doc.saveas(output_path)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    return {
+        "detected_board_width_mm": single_board_length,
+        "detected_board_height_mm": single_board_width,
+        "panel_width_mm": round(panel_w, 3),
+        "panel_height_mm": round(panel_h, 3),
+        "columns": columns,
+        "rows": rows,
+        "pcs_per_panel": columns * rows,
+        "gap_x_mm": gap_x,
+        "gap_y_mm": gap_y,
+        "split_method": candidate.get("split_method", "V-cut"),
+        "fallback": True
+    }
 
 
 # =========================================================
-# 本地保險產出：不依賴 Dify End outputs
+# 本地保險產出：即使 Dify 失敗也能產出真實連版 DXF
 # =========================================================
 
 def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any]:
@@ -742,18 +1047,33 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
     has_heavy_component = yes_no_to_bool(inputs.get("has_heavy_component", "No"))
     is_irregular_shape = yes_no_to_bool(inputs.get("is_irregular_shape", "No"))
 
-    # 先確認原始 DXF 可下載；如果下載失敗會丟錯
-    local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
+    local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_source.dxf")
     download_file_from_minio(object_key, local_input)
 
+    # 如果原始 DXF 的實際尺寸可讀，優先用實際 DXF bounding box 產生候選方案
+    detected_length = single_board_length
+    detected_width = single_board_width
+
     try:
-        os.remove(local_input)
+        source_doc = ezdxf.readfile(local_input)
+        detected_bbox = get_modelspace_bbox(source_doc)
+        if detected_bbox:
+            min_x, min_y, max_x, max_y = detected_bbox
+            detected_length = max_x - min_x
+            detected_width = max_y - min_y
+
+            if detected_length <= 0:
+                detected_length = single_board_length
+
+            if detected_width <= 0:
+                detected_width = single_board_width
     except Exception:
-        pass
+        detected_length = single_board_length
+        detected_width = single_board_width
 
     result = calculate_candidates(
-        single_board_length,
-        single_board_width,
+        detected_length,
+        detected_width,
         rail_width,
         smt_max_length,
         smt_max_width,
@@ -768,18 +1088,39 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
     candidate = result["best_candidate"]
 
     safe_name = safe_filename_name(product_name)
-
-    output_name = f"panelized_{safe_name}_{candidate['panel_type']}.dxf"
+    output_name = f"panelized_{safe_name}_{candidate['panel_type']}_real.dxf"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_name}")
 
-    create_panel_dxf(
-        output_path=output_path,
-        product_name=product_name,
-        single_board_length=single_board_length,
-        single_board_width=single_board_width,
-        rail_width=rail_width,
-        candidate=candidate
-    )
+    geometry_info = {}
+
+    try:
+        geometry_info = create_real_panel_dxf_from_source(
+            source_path=local_input,
+            output_path=output_path,
+            product_name=product_name,
+            single_board_length=detected_length,
+            single_board_width=detected_width,
+            rail_width=rail_width,
+            candidate=candidate
+        )
+        geometry_mode = "real_source_dxf_copied"
+
+    except Exception as e:
+        geometry_info = create_simple_panel_dxf_fallback(
+            output_path=output_path,
+            product_name=product_name,
+            single_board_length=detected_length,
+            single_board_width=detected_width,
+            rail_width=rail_width,
+            candidate=candidate
+        )
+        geometry_info["real_dxf_error"] = str(e)
+        geometry_mode = "simple_fallback"
+
+    try:
+        os.remove(local_input)
+    except Exception:
+        pass
 
     output_object_key = f"outputs/{uuid.uuid4()}/{output_name}"
 
@@ -794,15 +1135,8 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
     except Exception:
         pass
 
-    # 兩種下載連結都給
     minio_presigned_url = get_presigned_download_url(output_object_key, hours=24)
-    api_download_url = f"/api/pcb/download?object_key={output_object_key}"
-
-    report_text = build_ai_report_markdown(
-        product_name=product_name,
-        object_key=object_key,
-        result=result
-    )
+    api_download_url = make_public_api_download_url(output_object_key)
 
     panel_dxf = {
         "status": "success",
@@ -811,13 +1145,23 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "output_object_key": output_object_key,
         "output_filename": output_name,
         "download_url": api_download_url,
+        "api_download_url": api_download_url,
         "minio_presigned_url": minio_presigned_url,
         "expires_hours": 24,
+        "geometry_mode": geometry_mode,
+        "geometry_info": geometry_info,
         "best_candidate": candidate,
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
-        "message": "Panelized DXF generated by local fallback."
+        "message": "Panelized DXF generated by real DXF panelization engine."
     }
+
+    report_text = build_ai_report_markdown(
+        product_name=product_name,
+        object_key=object_key,
+        result=result,
+        panel_dxf=panel_dxf
+    )
 
     return {
         "report_text": report_text,
@@ -826,10 +1170,13 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "output_object_key": output_object_key,
         "output_filename": output_name,
         "download_url": api_download_url,
+        "api_download_url": api_download_url,
         "minio_presigned_url": minio_presigned_url,
         "best_candidate": candidate,
         "all_candidates": result["all_candidates"],
-        "candidates": result["candidates"]
+        "candidates": result["candidates"],
+        "geometry_info": geometry_info,
+        "geometry_mode": geometry_mode
     }
 
 
@@ -849,11 +1196,9 @@ def merge_local_outputs_into_dify_result(
 
     outputs = dify_result["data"]["outputs"]
 
-    # Dify 有報告就保留，沒有就補本地報告
     if not outputs.get("report_text"):
         outputs["report_text"] = local_outputs["report_text"]
 
-    # Dify 沒有 DXF 就補本地 DXF
     if not outputs.get("panel_dxf"):
         outputs["panel_dxf"] = local_outputs["panel_dxf"]
 
@@ -863,6 +1208,8 @@ def merge_local_outputs_into_dify_result(
     outputs["fallback_output_object_key"] = local_outputs["output_object_key"]
     outputs["fallback_output_filename"] = local_outputs["output_filename"]
     outputs["fallback_download_url"] = local_outputs["download_url"]
+    outputs["geometry_mode"] = local_outputs["geometry_mode"]
+    outputs["geometry_info"] = local_outputs["geometry_info"]
 
     dify_result["data"]["outputs"] = outputs
 
@@ -916,7 +1263,7 @@ async def upload_dxf_to_minio(
 
 
 # =========================================================
-# API：用 MinIO object_key 產生候選方案
+# API：候選方案
 # 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
@@ -939,14 +1286,27 @@ async def generate_panel_candidates_from_minio(
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
 
+    detected_length = single_board_length
+    detected_width = single_board_width
+
+    try:
+        source_doc = ezdxf.readfile(local_input)
+        detected_bbox = get_modelspace_bbox(source_doc)
+        if detected_bbox:
+            min_x, min_y, max_x, max_y = detected_bbox
+            detected_length = max_x - min_x
+            detected_width = max_y - min_y
+    except Exception:
+        pass
+
     try:
         os.remove(local_input)
     except Exception:
         pass
 
     result = calculate_candidates(
-        single_board_length,
-        single_board_width,
+        detected_length,
+        detected_width,
         rail_width,
         smt_max_length,
         smt_max_width,
@@ -967,9 +1327,13 @@ async def generate_panel_candidates_from_minio(
     return {
         "product_name": product_name,
         "object_key": object_key,
-        "stage": "phase_1_dxf_mvp_minio",
-        "note": "DXF 已儲存在 MinIO，Dify 僅傳 object_key，避免 Dify 檔案大小限制。",
-        "single_board": {
+        "stage": "phase_2_real_dxf_panelization",
+        "note": "已讀取 DXF bounding box，並產生所有候選連版方案。",
+        "detected_single_board": {
+            "length_mm": round(detected_length, 3),
+            "width_mm": round(detected_width, 3)
+        },
+        "input_single_board": {
             "length_mm": single_board_length,
             "width_mm": single_board_width
         },
@@ -992,7 +1356,7 @@ async def generate_panel_candidates_from_minio(
 
 
 # =========================================================
-# API：用 MinIO object_key 產生連版 DXF，並上傳回 MinIO
+# API：產生真實連版 DXF
 # 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
@@ -1056,25 +1420,46 @@ def download_from_minio(
 
 # =========================================================
 # 背景任務：呼叫 Dify Workflow
-# 重點：即使 Dify 失敗，也會本地產生 DXF 與 report_text
+# 重點：本地會先產出真實連版 DXF，確保可下載
 # =========================================================
 
 def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     JOB_STORE[job_id]["status"] = "running"
-    JOB_STORE[job_id]["message"] = "Dify Workflow 執行中..."
+    JOB_STORE[job_id]["message"] = "產生真實連版 DXF 並執行 Dify Workflow..."
     JOB_STORE[job_id]["started_at"] = datetime.utcnow().isoformat()
 
     local_outputs = None
 
     try:
-        # 先本地產出 DXF，確保無論 Dify 成敗都有檔案可以下載
+        # 先本地產生真實連版 DXF，確保無論 Dify 成敗都有檔案可以下載
         local_outputs = generate_local_panelization_outputs(inputs)
 
-        if not DIFY_API_BASE:
-            raise Exception("DIFY_API_BASE is not configured")
+        if not DIFY_API_BASE or not DIFY_API_KEY:
+            fallback_result = {
+                "task_id": None,
+                "workflow_run_id": None,
+                "data": {
+                    "status": "fallback_success",
+                    "outputs": {
+                        "report_text": local_outputs["report_text"],
+                        "panel_dxf": local_outputs["panel_dxf"],
+                        "panel_dxf_info": local_outputs["panel_dxf_info"],
+                        "fallback_output_object_key": local_outputs["output_object_key"],
+                        "fallback_output_filename": local_outputs["output_filename"],
+                        "fallback_download_url": local_outputs["download_url"],
+                        "geometry_mode": local_outputs["geometry_mode"],
+                        "geometry_info": local_outputs["geometry_info"]
+                    },
+                    "warning": "Dify API environment variables are not configured, but local real DXF generation succeeded."
+                }
+            }
 
-        if not DIFY_API_KEY:
-            raise Exception("DIFY_API_KEY is not configured")
+            JOB_STORE[job_id]["status"] = "success"
+            JOB_STORE[job_id]["message"] = "本地真實連版 DXF 已成功產生"
+            JOB_STORE[job_id]["result"] = fallback_result
+            JOB_STORE[job_id]["error"] = None
+            JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
+            return
 
         url = f"{DIFY_API_BASE.rstrip('/')}/workflows/run"
 
@@ -1122,15 +1507,17 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "panel_dxf_info": local_outputs["panel_dxf_info"],
                         "fallback_output_object_key": local_outputs["output_object_key"],
                         "fallback_output_filename": local_outputs["output_filename"],
-                        "fallback_download_url": local_outputs["download_url"]
+                        "fallback_download_url": local_outputs["download_url"],
+                        "geometry_mode": local_outputs["geometry_mode"],
+                        "geometry_info": local_outputs["geometry_info"]
                     },
-                    "warning": "Dify workflow API failed, but local DXF fallback succeeded.",
+                    "warning": "Dify workflow API failed, but local real DXF generation succeeded.",
                     "dify_error": response.text
                 }
             }
 
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 失敗，但本地 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 失敗，但本地真實連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -1150,15 +1537,17 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "panel_dxf_info": local_outputs["panel_dxf_info"],
                         "fallback_output_object_key": local_outputs["output_object_key"],
                         "fallback_output_filename": local_outputs["output_filename"],
-                        "fallback_download_url": local_outputs["download_url"]
+                        "fallback_download_url": local_outputs["download_url"],
+                        "geometry_mode": local_outputs["geometry_mode"],
+                        "geometry_info": local_outputs["geometry_info"]
                     },
-                    "warning": "Dify returned non-JSON response, but local DXF fallback succeeded.",
+                    "warning": "Dify returned non-JSON response, but local real DXF generation succeeded.",
                     "dify_response_preview": response.text[:1500]
                 }
             }
 
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但本地 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但本地真實連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -1169,24 +1558,22 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
         dify_data = result_json.get("data", {})
         dify_status = dify_data.get("status", "")
 
-        # Dify HTTP 200 但 Workflow failed，例如 LLM 429，也要補 DXF
         result_json = merge_local_outputs_into_dify_result(result_json, local_outputs)
 
         if dify_status == "failed":
             result_json["data"]["status"] = "fallback_success"
-            result_json["data"]["warning"] = "Dify workflow failed, but local DXF fallback succeeded."
+            result_json["data"]["warning"] = "Dify workflow failed, but local real DXF generation succeeded."
             result_json["data"]["original_dify_status"] = "failed"
 
         JOB_STORE[job_id]["status"] = "success"
-        JOB_STORE[job_id]["message"] = "Dify Workflow 已完成，並已確保 DXF 可下載"
+        JOB_STORE[job_id]["message"] = "真實連版 DXF 已完成，Dify 結果已合併"
         JOB_STORE[job_id]["result"] = result_json
         JOB_STORE[job_id]["error"] = None
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
     except Exception as e:
-        # 如果本地 fallback 也失敗，才算真正失敗
         JOB_STORE[job_id]["status"] = "failed"
-        JOB_STORE[job_id]["message"] = "Dify Workflow 與本地 DXF fallback 均失敗"
+        JOB_STORE[job_id]["message"] = "真實連版 DXF 產生失敗"
         JOB_STORE[job_id]["error"] = {
             "error_type": type(e).__name__,
             "error_detail": str(e),
@@ -1197,7 +1584,6 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
 
 # =========================================================
 # API：開始 Dify 背景任務
-# upload.html 會呼叫這支，不會等待 Dify 完成
 # =========================================================
 
 @app.post("/api/pcb/start-dify-job")
@@ -1257,8 +1643,7 @@ async def start_dify_job(
 
 
 # =========================================================
-# API：查詢 Dify 背景任務狀態
-# upload.html 每 3 秒查詢這支
+# API：查詢背景任務狀態
 # =========================================================
 
 @app.get("/api/pcb/job-status/{job_id}")
@@ -1272,7 +1657,7 @@ def get_job_status(job_id: str):
 
 
 # =========================================================
-# 舊版同步 API：保留但不建議前端使用
+# 舊版同步 API：現在也會產出真實連版 DXF
 # =========================================================
 
 @app.post("/api/pcb/run-dify-panelization")
@@ -1311,7 +1696,7 @@ async def run_dify_panelization(
 
     return {
         "status": "success",
-        "message": "Synchronous API used local DXF fallback output.",
+        "message": "Synchronous API used real DXF panelization output.",
         "data": {
             "outputs": {
                 "report_text": local_outputs["report_text"],
@@ -1319,7 +1704,9 @@ async def run_dify_panelization(
                 "panel_dxf_info": local_outputs["panel_dxf_info"],
                 "fallback_output_object_key": local_outputs["output_object_key"],
                 "fallback_output_filename": local_outputs["output_filename"],
-                "fallback_download_url": local_outputs["download_url"]
+                "fallback_download_url": local_outputs["download_url"],
+                "geometry_mode": local_outputs["geometry_mode"],
+                "geometry_info": local_outputs["geometry_info"]
             }
         }
     }
