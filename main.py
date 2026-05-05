@@ -266,7 +266,8 @@ def root():
         "version": "0.8.0-minio-dify-async-job",
         "message": "Use /upload for DXF upload page, or /docs for API testing.",
         "important_note": "This version includes real DXF panelization by reading source DXF entities with ezdxf.",
-        "display_rule": "Report only shows top 3 display_candidates. all_candidates are still kept for debugging."
+        "display_rule": "Report only shows top 3 display_candidates. all_candidates are still kept for debugging.",
+        "panel_feature_rule": "Auto determines Fiducial and Tooling Hole positions based on panel feature rule v1."
     }
 
 
@@ -544,6 +545,52 @@ def build_caution_and_not_summary(candidates: List[Dict[str, Any]], limit: int =
     return "\n".join(lines)
 
 
+def build_feature_summary_text(panel_features: Dict[str, Any]) -> str:
+    if not panel_features:
+        return "尚未取得 Fiducial / Tooling Hole 自動配置資訊。"
+
+    fiducials = panel_features.get("fiducials", [])
+    tooling_holes = panel_features.get("tooling_holes", [])
+    warnings = panel_features.get("warnings", [])
+    notes = panel_features.get("notes", [])
+
+    fid_lines = []
+    for f in fiducials:
+        fid_lines.append(
+            f"- {f.get('name')}：({f.get('x')}, {f.get('y')}) mm，直徑 {f.get('diameter_mm')} mm，位置 {f.get('location')}"
+        )
+
+    tooling_lines = []
+    for h in tooling_holes:
+        tooling_lines.append(
+            f"- {h.get('name')}：({h.get('x')}, {h.get('y')}) mm，直徑 {h.get('diameter_mm')} mm，位置 {h.get('location')}"
+        )
+
+    warning_lines = []
+    for w in warnings:
+        warning_lines.append(f"- {w}")
+
+    note_lines = []
+    for n in notes:
+        note_lines.append(f"- {n}")
+
+    return f"""
+配置規則：{panel_features.get("rule_summary", "")}
+
+Fiducial 配置：
+{chr(10).join(fid_lines) if fid_lines else "- 無"}
+
+Tooling Hole 配置：
+{chr(10).join(tooling_lines) if tooling_lines else "- 無"}
+
+注意事項：
+{chr(10).join(note_lines) if note_lines else "- 依一般 Panel 工藝邊規則配置"}
+
+警告：
+{chr(10).join(warning_lines) if warning_lines else "- 無重大警告"}
+""".strip()
+
+
 def build_ai_report_markdown(
     product_name: str,
     object_key: str,
@@ -555,11 +602,26 @@ def build_ai_report_markdown(
     caution_text = build_caution_and_not_summary(result["all_candidates"], limit=3)
 
     dxf_info = ""
+    feature_text = ""
+
     if panel_dxf:
+        geometry_info = panel_dxf.get("geometry_info", {}) or {}
+        panel_features = geometry_info.get("panel_features", {}) or {}
+
+        fiducial_count = panel_features.get("fiducial_count", "")
+        tooling_hole_count = panel_features.get("tooling_hole_count", "")
+        rule_summary = panel_features.get("rule_summary", "")
+
+        feature_text = build_feature_summary_text(panel_features)
+
         dxf_info = f"""
 - 輸出 DXF 檔名：{panel_dxf.get("output_filename", "")}
 - 輸出 object_key：{panel_dxf.get("output_object_key", "")}
 - 下載連結：{panel_dxf.get("download_url", "")}
+- 幾何產出模式：{panel_dxf.get("geometry_mode", "")}
+- Fiducial 數量：{fiducial_count}
+- Tooling Hole 數量：{tooling_hole_count}
+- 配置規則：{rule_summary}
 """.strip()
 
     report = f"""
@@ -594,7 +656,11 @@ def build_ai_report_markdown(
 
 {dxf_info if dxf_info else "DXF 已由系統產生，請於下載連結取得。"}
 
-## 六、製程風險提醒
+## 六、Fiducial / Tooling Hole 自動配置
+
+{feature_text if feature_text else "尚未取得 Fiducial / Tooling Hole 配置資訊。"}
+
+## 七、製程風險提醒
 
 - 若有 BGA/QFN，需確認元件距離 V-cut 或 Router 邊界的安全距離。
 - 若有 DIP，需確認波峰焊方向、錫流方向與治具需求。
@@ -602,16 +668,18 @@ def build_ai_report_markdown(
 - 若為異形板，通常不建議直接使用 V-cut，建議優先評估 Router 或 Tab。
 - 若 Panel 尺寸超過 SMT 或 ICT 限制，該方案應列為不建議。
 
-## 七、ME / CAM 最終確認清單
+## 八、ME / CAM 最終確認清單
 
 - 單板尺寸是否正確。
 - Panel 尺寸是否符合 SMT 最大進板限制。
 - Panel 尺寸是否符合 ICT 治具限制。
 - 分板方式是否符合產品結構與元件配置。
-- Fiducial、Tooling Hole、工藝邊寬度是否符合公司規範。
+- Fiducial 數量、位置與直徑是否符合公司連板設計規範。
+- Tooling Hole 數量、孔徑與位置是否符合治具定位需求。
+- 若工藝邊不足，需確認是否加寬工藝邊或調整定位孔位置。
 - 是否需要補強支撐、治具或調整過爐方向。
 
-## 八、輸出限制說明
+## 九、輸出限制說明
 
 本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
 """
@@ -703,6 +771,197 @@ def add_text(msp, text: str, x: float, y: float, height: float, layer: str):
         pass
 
 
+def auto_determine_panel_features(
+    panel_w: float,
+    panel_h: float,
+    rail_width: float,
+    columns: int,
+    rows: int,
+    split_method: str,
+    has_bga_qfn: bool = False,
+    has_dip: bool = False,
+    has_heavy_component: bool = False,
+    is_irregular_shape: bool = False
+) -> Dict[str, Any]:
+    """
+    PCB 連版 Fiducial / Tooling Hole 自動判斷規則。
+
+    保守通用版：
+    1. Fiducial：3 顆，放左上、右上、左下，避免完全對稱造成方向誤判。
+    2. Tooling Hole：4 顆，放四角工藝邊。
+    3. 若工藝邊不足，仍產生位置，但在 warning 中提醒 ME/CAM 確認。
+    4. 若為異形板或 Router / Tab，定位點仍優先放 Panel 工藝邊。
+    """
+
+    warnings: List[str] = []
+    notes: List[str] = []
+
+    fiducial_diameter_mm = 1.0
+    fiducial_radius_mm = fiducial_diameter_mm / 2.0
+
+    tooling_hole_diameter_mm = 3.2
+    tooling_hole_radius_mm = tooling_hole_diameter_mm / 2.0
+
+    min_rail_for_fiducial_mm = 4.0
+    min_rail_for_tooling_mm = 5.0
+
+    min_edge_clearance_fiducial_mm = 4.0
+    min_edge_clearance_tooling_mm = 5.0
+
+    tooling_margin = max(
+        min_edge_clearance_tooling_mm,
+        rail_width / 2.0
+    )
+
+    fiducial_margin = max(
+        min_edge_clearance_fiducial_mm,
+        rail_width / 2.0
+    )
+
+    tooling_margin = min(
+        tooling_margin,
+        max(panel_w / 4.0, 1.0),
+        max(panel_h / 4.0, 1.0)
+    )
+
+    fiducial_margin = min(
+        fiducial_margin,
+        max(panel_w / 4.0, 1.0),
+        max(panel_h / 4.0, 1.0)
+    )
+
+    if rail_width < min_rail_for_fiducial_mm:
+        warnings.append(
+            f"工藝邊 {rail_width:.1f} mm 小於 Fiducial 建議工藝邊 {min_rail_for_fiducial_mm:.1f} mm，請 ME/CAM 確認是否需加寬工藝邊。"
+        )
+
+    if rail_width < min_rail_for_tooling_mm:
+        warnings.append(
+            f"工藝邊 {rail_width:.1f} mm 小於 Tooling Hole 建議工藝邊 {min_rail_for_tooling_mm:.1f} mm，定位孔可能過於靠近板邊。"
+        )
+
+    if has_bga_qfn:
+        notes.append("有 BGA/QFN，Fiducial 建議保留 3 顆以上，並確認是否需要局部 Fiducial。")
+
+    if has_dip:
+        notes.append("有 DIP，Tooling Hole 與治具定位需確認不干涉波峰焊治具與錫流方向。")
+
+    if has_heavy_component:
+        notes.append("有重零件，需確認定位孔與支撐治具是否足以降低過爐板彎。")
+
+    if is_irregular_shape or "Router" in split_method or "Tab" in split_method:
+        notes.append("異形板或 Router / Tab 分板時，Fiducial 與 Tooling Hole 優先放在 Panel 工藝邊。")
+
+    tooling_holes = [
+        {
+            "name": "TH1",
+            "x": round(tooling_margin, 3),
+            "y": round(tooling_margin, 3),
+            "diameter_mm": tooling_hole_diameter_mm,
+            "radius_mm": tooling_hole_radius_mm,
+            "location": "bottom-left"
+        },
+        {
+            "name": "TH2",
+            "x": round(panel_w - tooling_margin, 3),
+            "y": round(tooling_margin, 3),
+            "diameter_mm": tooling_hole_diameter_mm,
+            "radius_mm": tooling_hole_radius_mm,
+            "location": "bottom-right"
+        },
+        {
+            "name": "TH3",
+            "x": round(tooling_margin, 3),
+            "y": round(panel_h - tooling_margin, 3),
+            "diameter_mm": tooling_hole_diameter_mm,
+            "radius_mm": tooling_hole_radius_mm,
+            "location": "top-left"
+        },
+        {
+            "name": "TH4",
+            "x": round(panel_w - tooling_margin, 3),
+            "y": round(panel_h - tooling_margin, 3),
+            "diameter_mm": tooling_hole_diameter_mm,
+            "radius_mm": tooling_hole_radius_mm,
+            "location": "top-right"
+        }
+    ]
+
+    fiducials = [
+        {
+            "name": "FD1",
+            "x": round(fiducial_margin, 3),
+            "y": round(panel_h - fiducial_margin, 3),
+            "diameter_mm": fiducial_diameter_mm,
+            "radius_mm": fiducial_radius_mm,
+            "location": "top-left"
+        },
+        {
+            "name": "FD2",
+            "x": round(panel_w - fiducial_margin, 3),
+            "y": round(panel_h - fiducial_margin, 3),
+            "diameter_mm": fiducial_diameter_mm,
+            "radius_mm": fiducial_radius_mm,
+            "location": "top-right"
+        },
+        {
+            "name": "FD3",
+            "x": round(fiducial_margin, 3),
+            "y": round(fiducial_margin, 3),
+            "diameter_mm": fiducial_diameter_mm,
+            "radius_mm": fiducial_radius_mm,
+            "location": "bottom-left"
+        }
+    ]
+
+    return {
+        "rule_version": "panel_feature_rule_v1",
+        "fiducials": fiducials,
+        "tooling_holes": tooling_holes,
+        "fiducial_count": len(fiducials),
+        "tooling_hole_count": len(tooling_holes),
+        "fiducial_diameter_mm": fiducial_diameter_mm,
+        "tooling_hole_diameter_mm": tooling_hole_diameter_mm,
+        "warnings": warnings,
+        "notes": notes,
+        "rule_summary": (
+            f"Fiducial 採 3 點配置，Tooling Hole 採 4 角配置。"
+            f"Fiducial 直徑 {fiducial_diameter_mm:.1f} mm，"
+            f"Tooling Hole 直徑 {tooling_hole_diameter_mm:.1f} mm。"
+        )
+    }
+
+
+def draw_panel_features(
+    msp,
+    feature_result: Dict[str, Any],
+    tooling_layer: str = "PANEL_TOOLING",
+    fiducial_layer: str = "PANEL_FIDUCIAL",
+    text_layer: str = "PANEL_TEXT"
+):
+    """
+    將 auto_determine_panel_features() 計算出的 Fiducial / Tooling Hole 畫到 DXF。
+    """
+
+    for hole in feature_result.get("tooling_holes", []):
+        x = float(hole["x"])
+        y = float(hole["y"])
+        r = float(hole["radius_mm"])
+        name = str(hole["name"])
+
+        add_circle(msp, x, y, r, tooling_layer)
+        add_text(msp, name, x + r + 0.8, y + r + 0.8, 1.5, text_layer)
+
+    for fid in feature_result.get("fiducials", []):
+        x = float(fid["x"])
+        y = float(fid["y"])
+        r = float(fid["radius_mm"])
+        name = str(fid["name"])
+
+        add_circle(msp, x, y, r, fiducial_layer)
+        add_text(msp, name, x + r + 0.8, y + r + 0.8, 1.5, text_layer)
+
+
 def create_real_panel_dxf_from_source(
     source_path: str,
     output_path: str,
@@ -710,7 +969,11 @@ def create_real_panel_dxf_from_source(
     single_board_length: float,
     single_board_width: float,
     rail_width: float,
-    candidate: Dict[str, Any]
+    candidate: Dict[str, Any],
+    has_bga_qfn: bool = False,
+    has_dip: bool = False,
+    has_heavy_component: bool = False,
+    is_irregular_shape: bool = False
 ) -> Dict[str, Any]:
 
     doc = ezdxf.readfile(source_path)
@@ -855,20 +1118,26 @@ def create_real_panel_dxf_from_source(
                 "PANEL_ROUTE"
             )
 
-    tooling_r = 1.6
-    tooling_margin = max(rail_width / 2.0, 2.5)
+    feature_result = auto_determine_panel_features(
+        panel_w=panel_w,
+        panel_h=panel_h,
+        rail_width=rail_width,
+        columns=columns,
+        rows=rows,
+        split_method=split_method,
+        has_bga_qfn=has_bga_qfn,
+        has_dip=has_dip,
+        has_heavy_component=has_heavy_component,
+        is_irregular_shape=is_irregular_shape
+    )
 
-    add_circle(msp, tooling_margin, tooling_margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, panel_w - tooling_margin, tooling_margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, panel_w - tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
-
-    fid_r = 0.75
-    fid_margin = max(rail_width, 3.0)
-
-    add_circle(msp, fid_margin, panel_h - fid_margin, fid_r, "PANEL_FIDUCIAL")
-    add_circle(msp, panel_w - fid_margin, panel_h - fid_margin, fid_r, "PANEL_FIDUCIAL")
-    add_circle(msp, fid_margin, fid_margin, fid_r, "PANEL_FIDUCIAL")
+    draw_panel_features(
+        msp=msp,
+        feature_result=feature_result,
+        tooling_layer="PANEL_TOOLING",
+        fiducial_layer="PANEL_FIDUCIAL",
+        text_layer="PANEL_TEXT"
+    )
 
     text_y = panel_h + 8
 
@@ -910,9 +1179,18 @@ def create_real_panel_dxf_from_source(
 
     add_text(
         msp,
-        "AI suggested DXF. ME/CAM confirmation required before production.",
+        f"Fiducial: {feature_result.get('fiducial_count')} pcs, Tooling Hole: {feature_result.get('tooling_hole_count')} pcs",
         0,
         text_y - 16,
+        2.5,
+        "PANEL_TEXT"
+    )
+
+    add_text(
+        msp,
+        "AI suggested DXF. ME/CAM confirmation required before production.",
+        0,
+        text_y - 20,
         2.5,
         "PANEL_TEXT"
     )
@@ -971,7 +1249,8 @@ def create_real_panel_dxf_from_source(
         "rail_right_mm": rail_right,
         "rail_top_mm": rail_top,
         "rail_bottom_mm": rail_bottom,
-        "split_method": split_method
+        "split_method": split_method,
+        "panel_features": feature_result
     }
 
 
@@ -981,7 +1260,11 @@ def create_simple_panel_dxf_fallback(
     single_board_length: float,
     single_board_width: float,
     rail_width: float,
-    candidate: Dict[str, Any]
+    candidate: Dict[str, Any],
+    has_bga_qfn: bool = False,
+    has_dip: bool = False,
+    has_heavy_component: bool = False,
+    is_irregular_shape: bool = False
 ) -> Dict[str, Any]:
 
     doc = ezdxf.new("R2010")
@@ -1021,22 +1304,31 @@ def create_simple_panel_dxf_fallback(
         y = rail_width + row * single_board_width + (row - 0.5) * gap_y
         add_line(msp, rail_width, y, panel_w - rail_width, y, "PANEL_VCUT")
 
-    tooling_r = 1.6
-    margin = max(rail_width / 2.0, 2.5)
+    feature_result = auto_determine_panel_features(
+        panel_w=panel_w,
+        panel_h=panel_h,
+        rail_width=rail_width,
+        columns=columns,
+        rows=rows,
+        split_method=candidate.get("split_method", "V-cut"),
+        has_bga_qfn=has_bga_qfn,
+        has_dip=has_dip,
+        has_heavy_component=has_heavy_component,
+        is_irregular_shape=is_irregular_shape
+    )
 
-    add_circle(msp, margin, margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, panel_w - margin, margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, margin, panel_h - margin, tooling_r, "PANEL_TOOLING")
-    add_circle(msp, panel_w - margin, panel_h - margin, tooling_r, "PANEL_TOOLING")
-
-    fid_r = 0.75
-    add_circle(msp, rail_width, rail_width, fid_r, "PANEL_FIDUCIAL")
-    add_circle(msp, panel_w - rail_width, rail_width, fid_r, "PANEL_FIDUCIAL")
-    add_circle(msp, rail_width, panel_h - rail_width, fid_r, "PANEL_FIDUCIAL")
+    draw_panel_features(
+        msp=msp,
+        feature_result=feature_result,
+        tooling_layer="PANEL_TOOLING",
+        fiducial_layer="PANEL_FIDUCIAL",
+        text_layer="PANEL_TEXT"
+    )
 
     add_text(msp, f"Product: {product_name}", 0, panel_h + 8, 2.5, "PANEL_TEXT")
     add_text(msp, f"Panel: {columns} x {rows}, {columns * rows} pcs", 0, panel_h + 4, 2.5, "PANEL_TEXT")
-    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h, 2.5, "PANEL_TEXT")
+    add_text(msp, f"Fiducial: {feature_result.get('fiducial_count')} pcs, Tooling Hole: {feature_result.get('tooling_hole_count')} pcs", 0, panel_h, 2.5, "PANEL_TEXT")
+    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h - 4, 2.5, "PANEL_TEXT")
 
     doc.saveas(output_path)
 
@@ -1051,6 +1343,7 @@ def create_simple_panel_dxf_fallback(
         "gap_x_mm": gap_x,
         "gap_y_mm": gap_y,
         "split_method": candidate.get("split_method", "V-cut"),
+        "panel_features": feature_result,
         "fallback": True
     }
 
@@ -1129,7 +1422,11 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
             single_board_length=detected_length,
             single_board_width=detected_width,
             rail_width=rail_width,
-            candidate=candidate
+            candidate=candidate,
+            has_bga_qfn=has_bga_qfn,
+            has_dip=has_dip,
+            has_heavy_component=has_heavy_component,
+            is_irregular_shape=is_irregular_shape
         )
         geometry_mode = "real_source_dxf_copied"
 
@@ -1140,7 +1437,11 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
             single_board_length=detected_length,
             single_board_width=detected_width,
             rail_width=rail_width,
-            candidate=candidate
+            candidate=candidate,
+            has_bga_qfn=has_bga_qfn,
+            has_dip=has_dip,
+            has_heavy_component=has_heavy_component,
+            is_irregular_shape=is_irregular_shape
         )
         geometry_info["real_dxf_error"] = str(e)
         geometry_mode = "simple_fallback"
@@ -1182,7 +1483,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "display_candidates": result["display_candidates"],
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
-        "message": "Panelized DXF generated by real DXF panelization engine."
+        "message": "Panelized DXF generated by real DXF panelization engine with auto Fiducial and Tooling Hole placement."
     }
 
     report_text = build_ai_report_markdown(
