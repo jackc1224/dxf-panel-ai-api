@@ -14,7 +14,7 @@ from minio import Minio
 from minio.error import S3Error
 
 
-app = FastAPI(title="PCB Panelization API", version="0.8.0-minio-dify-async-job")
+app = FastAPI(title="PCB Panelization API", version="0.9.0-all-candidates-status-zh")
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,6 +72,15 @@ def normalize_yes_no(value: str) -> str:
     return "No"
 
 
+def yes_no_to_bool(value: Any) -> bool:
+    v = str(value).strip().lower()
+
+    if v in ["yes", "true", "1", "是", "y"]:
+        return True
+
+    return False
+
+
 def safe_filename_name(filename: str) -> str:
     return (
         filename
@@ -86,6 +95,29 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def status_to_zh(status_code: str) -> str:
+    mapping = {
+        "recommended": "建議",
+        "use_with_caution": "謹慎使用",
+        "not_recommended": "不建議"
+    }
+    return mapping.get(status_code, status_code)
+
+
+def risk_level_zh(risk_score: int) -> str:
+    if risk_score >= 100:
+        return "高風險"
+    if risk_score >= 40:
+        return "中風險"
+    return "低風險"
+
+
+def reasons_to_text(reasons: List[str]) -> str:
+    if not reasons:
+        return "符合目前尺寸與製程限制，無明顯重大風險。"
+    return "；".join(reasons)
 
 
 # =========================================================
@@ -190,7 +222,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.8.0-minio-dify-async-job",
+        "version": "0.9.0-all-candidates-status-zh",
         "message": "Use /upload for DXF upload page, or /docs for API testing."
     }
 
@@ -302,7 +334,9 @@ def calculate_candidates(
 
         if ict_max_length > 0 and ict_max_width > 0:
             if panel_length > ict_max_length or panel_width > ict_max_width:
-                reasons.append("Panel 尺寸可能超過 ICT 治具限制")
+                reasons.append(
+                    f"Panel 尺寸 {panel_length:.1f} x {panel_width:.1f} mm 可能超過 ICT 治具限制 {ict_max_length:.1f} x {ict_max_width:.1f} mm"
+                )
                 risk_score += 30
 
         aspect_ratio = max(panel_length, panel_width) / min(panel_length, panel_width)
@@ -333,28 +367,35 @@ def calculate_candidates(
             risk_score += 10
 
         if risk_score >= 100:
-            status = "not_recommended"
+            status_code = "not_recommended"
         elif risk_score >= 40:
-            status = "use_with_caution"
+            status_code = "use_with_caution"
         else:
-            status = "recommended"
+            status_code = "recommended"
 
-        candidates.append({
+        candidate = {
             "panel_type": f"{x_count}x{y_count}",
             "x_count": x_count,
             "y_count": y_count,
             "panel_length_mm": round(panel_length, 2),
             "panel_width_mm": round(panel_width, 2),
+            "panel_size": f"{panel_length:.1f} x {panel_width:.1f} mm",
             "pcs_per_panel": pcs_per_panel,
             "aspect_ratio": round(aspect_ratio, 2),
             "split_method": split_method,
             "risk_score": risk_score,
-            "status": status,
-            "reasons": reasons
-        })
+            "risk_level_zh": risk_level_zh(risk_score),
+            "status_code": status_code,
+            "status_zh": status_to_zh(status_code),
+            "recommended_conclusion": status_to_zh(status_code),
+            "reasons": reasons,
+            "reason_text": reasons_to_text(reasons)
+        }
+
+        candidates.append(candidate)
 
     recommended = sorted(
-        [c for c in candidates if c["status"] == "recommended"],
+        [c for c in candidates if c["status_code"] == "recommended"],
         key=lambda x: (
             -x["pcs_per_panel"],
             x["risk_score"],
@@ -362,18 +403,155 @@ def calculate_candidates(
         )
     )
 
+    caution = sorted(
+        [c for c in candidates if c["status_code"] == "use_with_caution"],
+        key=lambda x: (
+            -x["pcs_per_panel"],
+            x["risk_score"],
+            x["panel_length_mm"] * x["panel_width_mm"]
+        )
+    )
+
+    not_recommended = sorted(
+        [c for c in candidates if c["status_code"] == "not_recommended"],
+        key=lambda x: (
+            x["risk_score"],
+            -x["pcs_per_panel"]
+        )
+    )
+
     if recommended:
         best_candidate = recommended[0]
+    elif caution:
+        best_candidate = caution[0]
     else:
-        best_candidate = sorted(
-            candidates,
-            key=lambda x: (x["risk_score"], -x["pcs_per_panel"])
-        )[0]
+        best_candidate = not_recommended[0]
+
+    comparison_table_markdown = build_comparison_table_markdown(candidates)
+    not_recommended_summary = build_not_recommended_summary(candidates)
+    recommendation_summary = build_recommendation_summary(best_candidate)
 
     return {
         "best_candidate": best_candidate,
-        "candidates": candidates
+        "all_candidates": candidates,
+        "candidates": candidates,
+        "recommended_candidates": recommended,
+        "caution_candidates": caution,
+        "not_recommended_candidates": not_recommended,
+        "comparison_table_markdown": comparison_table_markdown,
+        "not_recommended_summary": not_recommended_summary,
+        "recommendation_summary": recommendation_summary
     }
+
+
+def build_comparison_table_markdown(candidates: List[Dict[str, Any]]) -> str:
+    lines = []
+    lines.append("| 方案 | Panel 尺寸 | pcs/panel | 分板方式 | 風險分數 | 風險等級 | 狀態 | 建議原因 |")
+    lines.append("|---|---:|---:|---|---:|---|---|---|")
+
+    for c in candidates:
+        lines.append(
+            f"| {c['panel_type']} "
+            f"| {c['panel_size']} "
+            f"| {c['pcs_per_panel']} "
+            f"| {c['split_method']} "
+            f"| {c['risk_score']} "
+            f"| {c['risk_level_zh']} "
+            f"| {c['status_zh']} "
+            f"| {c['reason_text']} |"
+        )
+
+    return "\n".join(lines)
+
+
+def build_not_recommended_summary(candidates: List[Dict[str, Any]]) -> str:
+    lines = []
+
+    caution_or_not = [
+        c for c in candidates
+        if c["status_code"] in ["use_with_caution", "not_recommended"]
+    ]
+
+    if not caution_or_not:
+        return "本次所有候選方案皆為建議方案，未出現謹慎使用或不建議方案。"
+
+    for c in caution_or_not:
+        lines.append(
+            f"- 方案 {c['panel_type']}：{c['status_zh']}，原因：{c['reason_text']}"
+        )
+
+    return "\n".join(lines)
+
+
+def build_recommendation_summary(best_candidate: Dict[str, Any]) -> str:
+    return (
+        f"本次系統推薦方案為 {best_candidate['panel_type']}，"
+        f"Panel 尺寸為 {best_candidate['panel_size']}，"
+        f"每 Panel 可生產 {best_candidate['pcs_per_panel']} pcs，"
+        f"建議分板方式為 {best_candidate['split_method']}。"
+        f"此方案風險分數為 {best_candidate['risk_score']}，"
+        f"狀態為「{best_candidate['status_zh']}」。"
+        f"主要判斷原因：{best_candidate['reason_text']}"
+    )
+
+
+def build_ai_report_markdown(
+    product_name: str,
+    object_key: str,
+    result: Dict[str, Any]
+) -> str:
+    best = result["best_candidate"]
+
+    report = f"""
+# PCB 連版規劃 AI 建議報告
+
+## 一、AI 建議結論
+
+- 產品名稱：{product_name}
+- 原始 DXF object_key：{object_key}
+- 建議連版方式：{best["panel_type"]}
+- 建議 Panel 尺寸：{best["panel_size"]}
+- 每 Panel 數量：{best["pcs_per_panel"]} pcs/panel
+- 建議分板方式：{best["split_method"]}
+- 風險分數：{best["risk_score"]}
+- 風險等級：{best["risk_level_zh"]}
+- 狀態：{best["status_zh"]}
+- 是否可進入下一階段：{"可進入下一階段，但仍需 ME / CAM 工程師確認" if best["status_code"] == "recommended" else "需先由 ME / CAM 工程師審查後再決定"}
+
+## 二、方案比較表
+
+{result["comparison_table_markdown"]}
+
+## 三、推薦方案說明
+
+{result["recommendation_summary"]}
+
+## 四、謹慎使用與不建議方案原因
+
+{result["not_recommended_summary"]}
+
+## 五、製程風險提醒
+
+- 若有 BGA/QFN，需確認元件距離 V-cut 或 Router 邊界的安全距離。
+- 若有 DIP，需確認波峰焊方向、錫流方向與治具需求。
+- 若有重零件，需評估過爐板彎、支撐方式與分板應力。
+- 若為異形板，通常不建議直接使用 V-cut，建議優先評估 Router 或 Tab。
+- 若 Panel 尺寸超過 SMT 或 ICT 限制，該方案應列為不建議。
+
+## 六、ME / CAM 最終確認清單
+
+- 單板尺寸是否正確。
+- Panel 尺寸是否符合 SMT 最大進板限制。
+- Panel 尺寸是否符合 ICT 治具限制。
+- 分板方式是否符合產品結構與元件配置。
+- Fiducial、Tooling Hole、工藝邊寬度是否符合公司規範。
+- 是否需要補強支撐、治具或調整過爐方向。
+
+## 七、輸出限制說明
+
+本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-cut、Router、Fiducial、Tooling Hole 與分板應力。
+"""
+    return report.strip()
 
 
 # =========================================================
@@ -614,7 +792,6 @@ async def upload_dxf_to_minio(
 
 # =========================================================
 # API：用 MinIO object_key 產生候選方案
-# 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
 @app.post("/api/pcb/generate-panel-candidates-from-minio")
@@ -628,10 +805,10 @@ async def generate_panel_candidates_from_minio(
     smt_max_width: float = Form(250.0),
     ict_max_length: float = Form(350.0),
     ict_max_width: float = Form(300.0),
-    has_bga_qfn: bool = Form(False),
-    has_dip: bool = Form(False),
-    has_heavy_component: bool = Form(False),
-    is_irregular_shape: bool = Form(False)
+    has_bga_qfn: str = Form("No"),
+    has_dip: str = Form("No"),
+    has_heavy_component: str = Form("No"),
+    is_irregular_shape: str = Form("No")
 ):
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
@@ -649,10 +826,16 @@ async def generate_panel_candidates_from_minio(
         smt_max_width,
         ict_max_length,
         ict_max_width,
-        has_bga_qfn,
-        has_dip,
-        has_heavy_component,
-        is_irregular_shape
+        yes_no_to_bool(has_bga_qfn),
+        yes_no_to_bool(has_dip),
+        yes_no_to_bool(has_heavy_component),
+        yes_no_to_bool(is_irregular_shape)
+    )
+
+    report_markdown = build_ai_report_markdown(
+        product_name=product_name,
+        object_key=object_key,
+        result=result
     )
 
     return {
@@ -671,13 +854,20 @@ async def generate_panel_candidates_from_minio(
             "ict_max_width": ict_max_width
         },
         "best_candidate": result["best_candidate"],
-        "candidates": result["candidates"]
+        "all_candidates": result["all_candidates"],
+        "candidates": result["candidates"],
+        "recommended_candidates": result["recommended_candidates"],
+        "caution_candidates": result["caution_candidates"],
+        "not_recommended_candidates": result["not_recommended_candidates"],
+        "comparison_table_markdown": result["comparison_table_markdown"],
+        "recommendation_summary": result["recommendation_summary"],
+        "not_recommended_summary": result["not_recommended_summary"],
+        "report_markdown": report_markdown
     }
 
 
 # =========================================================
 # API：用 MinIO object_key 產生連版 DXF，並上傳回 MinIO
-# 這支給 Dify Workflow 的 HTTP Request 節點使用
 # =========================================================
 
 @app.post("/api/pcb/generate-panel-dxf-from-minio")
@@ -691,10 +881,10 @@ async def generate_panel_dxf_from_minio(
     smt_max_width: float = Form(250.0),
     ict_max_length: float = Form(350.0),
     ict_max_width: float = Form(300.0),
-    has_bga_qfn: bool = Form(False),
-    has_dip: bool = Form(False),
-    has_heavy_component: bool = Form(False),
-    is_irregular_shape: bool = Form(False)
+    has_bga_qfn: str = Form("No"),
+    has_dip: str = Form("No"),
+    has_heavy_component: str = Form("No"),
+    is_irregular_shape: str = Form("No")
 ):
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_input.dxf")
     download_file_from_minio(object_key, local_input)
@@ -712,10 +902,10 @@ async def generate_panel_dxf_from_minio(
         smt_max_width,
         ict_max_length,
         ict_max_width,
-        has_bga_qfn,
-        has_dip,
-        has_heavy_component,
-        is_irregular_shape
+        yes_no_to_bool(has_bga_qfn),
+        yes_no_to_bool(has_dip),
+        yes_no_to_bool(has_heavy_component),
+        yes_no_to_bool(is_irregular_shape)
     )
 
     candidate = result["best_candidate"]
@@ -758,6 +948,10 @@ async def generate_panel_dxf_from_minio(
         "download_url": download_url,
         "expires_hours": 24,
         "best_candidate": candidate,
+        "all_candidates": result["all_candidates"],
+        "comparison_table_markdown": result["comparison_table_markdown"],
+        "recommendation_summary": result["recommendation_summary"],
+        "not_recommended_summary": result["not_recommended_summary"],
         "message": "Panelized DXF generated and uploaded to MinIO."
     }
 
@@ -786,7 +980,6 @@ def download_from_minio(
 
 # =========================================================
 # 背景任務：呼叫 Dify Workflow
-# 不再 blocking 等待瀏覽器，避免 502 Bad Gateway
 # =========================================================
 
 def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
@@ -882,7 +1075,6 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
 
 # =========================================================
 # API：開始 Dify 背景任務
-# upload.html 會呼叫這支，不會等待 Dify 完成
 # =========================================================
 
 @app.post("/api/pcb/start-dify-job")
@@ -943,7 +1135,6 @@ async def start_dify_job(
 
 # =========================================================
 # API：查詢 Dify 背景任務狀態
-# upload.html 每 3 秒查詢這支
 # =========================================================
 
 @app.get("/api/pcb/job-status/{job_id}")
