@@ -131,6 +131,36 @@ def make_public_api_download_url(object_key: str) -> str:
     return f"/api/pcb/download?object_key={object_key}"
 
 
+def select_display_candidates(candidates: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    報告最多只顯示前 limit 個候選方案。
+
+    排序邏輯：
+    1. 優先顯示建議方案
+    2. 再顯示謹慎使用方案
+    3. 最後顯示不建議方案
+    4. 同類型中 pcs/panel 越高越優先
+    5. 風險分數越低越優先
+    """
+    status_priority = {
+        "recommended": 0,
+        "use_with_caution": 1,
+        "not_recommended": 2
+    }
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda c: (
+            status_priority.get(c.get("status_code", ""), 9),
+            -int(c.get("pcs_per_panel", 0)),
+            int(c.get("risk_score", 9999)),
+            float(c.get("panel_length_mm", 9999)) * float(c.get("panel_width_mm", 9999))
+        )
+    )
+
+    return sorted_candidates[:limit]
+
+
 # =========================================================
 # MinIO 共用函式
 # =========================================================
@@ -235,7 +265,8 @@ def root():
         "service": "PCB Panelization API",
         "version": "0.8.0-minio-dify-async-job",
         "message": "Use /upload for DXF upload page, or /docs for API testing.",
-        "important_note": "This version includes real DXF panelization by reading source DXF entities with ezdxf."
+        "important_note": "This version includes real DXF panelization by reading source DXF entities with ezdxf.",
+        "display_rule": "Report only shows top 3 display_candidates. all_candidates are still kept for debugging."
     }
 
 
@@ -460,8 +491,11 @@ def calculate_candidates(
     else:
         best_candidate = not_recommended[0]
 
+    display_candidates = select_display_candidates(candidates, limit=3)
+
     return {
         "best_candidate": best_candidate,
+        "display_candidates": display_candidates,
         "candidates": candidates,
         "all_candidates": candidates,
         "recommended_candidates": recommended,
@@ -470,12 +504,14 @@ def calculate_candidates(
     }
 
 
-def build_comparison_table_markdown(candidates: List[Dict[str, Any]]) -> str:
+def build_comparison_table_markdown(candidates: List[Dict[str, Any]], limit: int = 3) -> str:
+    display_candidates = select_display_candidates(candidates, limit=limit)
+
     lines = []
     lines.append("| 方案 | Panel 尺寸 | pcs/panel | 分板方式 | 風險分數 | 風險等級 | 狀態 | 建議原因 |")
     lines.append("|---|---:|---:|---|---:|---|---|---|")
 
-    for c in candidates:
+    for c in display_candidates:
         lines.append(
             f"| {c['panel_type']} "
             f"| {c['panel_size']} "
@@ -490,14 +526,16 @@ def build_comparison_table_markdown(candidates: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_caution_and_not_summary(candidates: List[Dict[str, Any]]) -> str:
+def build_caution_and_not_summary(candidates: List[Dict[str, Any]], limit: int = 3) -> str:
+    display_candidates = select_display_candidates(candidates, limit=limit)
+
     items = [
-        c for c in candidates
+        c for c in display_candidates
         if c["status_code"] in ["use_with_caution", "not_recommended"]
     ]
 
     if not items:
-        return "本次所有候選方案皆為建議方案，未出現謹慎使用或不建議方案。"
+        return "本次顯示的前三個候選方案皆為建議方案，未出現謹慎使用或不建議方案。"
 
     lines = []
     for c in items:
@@ -513,8 +551,8 @@ def build_ai_report_markdown(
     panel_dxf: Optional[Dict[str, Any]] = None
 ) -> str:
     best = result["best_candidate"]
-    comparison_table = build_comparison_table_markdown(result["all_candidates"])
-    caution_text = build_caution_and_not_summary(result["all_candidates"])
+    comparison_table = build_comparison_table_markdown(result["all_candidates"], limit=3)
+    caution_text = build_caution_and_not_summary(result["all_candidates"], limit=3)
 
     dxf_info = ""
     if panel_dxf:
@@ -540,7 +578,7 @@ def build_ai_report_markdown(
 - 狀態：{best["status_zh"]}
 - 是否可進入下一階段：{"可進入下一階段，但仍需 ME / CAM 工程師確認" if best["status_code"] == "recommended" else "需先由 ME / CAM 工程師審查後再決定"}
 
-## 二、全部候選方案比較表
+## 二、前三個候選方案比較表
 
 {comparison_table}
 
@@ -548,7 +586,7 @@ def build_ai_report_markdown(
 
 本次系統推薦方案為 {best["panel_type"]}，Panel 尺寸為 {best["panel_size"]}，每 Panel 可生產 {best["pcs_per_panel"]} pcs，建議分板方式為 {best["split_method"]}。此方案風險分數為 {best["risk_score"]}，風險等級為「{best["risk_level_zh"]}」，狀態為「{best["status_zh"]}」。主要判斷原因：{best["reason_text"]}
 
-## 四、謹慎使用與不建議方案原因
+## 四、前三個候選方案中，謹慎使用與不建議方案原因
 
 {caution_text}
 
@@ -726,7 +764,6 @@ def create_real_panel_dxf_from_source(
 
     source_entities = list(msp)
 
-    # 把原始單板移到第一格位置
     base_dx = rail_left - min_x
     base_dy = rail_bottom - min_y
     base_matrix = Matrix44.translate(base_dx, base_dy, 0)
@@ -734,7 +771,6 @@ def create_real_panel_dxf_from_source(
     for entity in source_entities:
         transform_entity_safe(entity, base_matrix)
 
-    # 複製到其他格
     for row in range(rows):
         for col in range(columns):
             if row == 0 and col == 0:
@@ -752,7 +788,6 @@ def create_real_panel_dxf_from_source(
                 except Exception:
                     continue
 
-    # Panel 外框
     add_lwpolyline_rect(
         msp,
         0,
@@ -762,7 +797,6 @@ def create_real_panel_dxf_from_source(
         "PANEL_OUTLINE"
     )
 
-    # 每片板外框輔助線
     for row in range(rows):
         for col in range(columns):
             x = rail_left + col * pitch_x
@@ -776,8 +810,7 @@ def create_real_panel_dxf_from_source(
                 "PANEL_OUTLINE"
             )
 
-    # 分板線
-    if "V-cut" in split_method or "V-CUT" in split_method or "V" in split_method:
+    if "V-cut" in split_method or "V-CUT" in split_method or split_method == "V-cut":
         for col in range(1, columns):
             x = rail_left + col * board_w + (col - 0.5) * gap_x
             add_line(
@@ -802,7 +835,6 @@ def create_real_panel_dxf_from_source(
     else:
         for col in range(1, columns):
             x1 = rail_left + col * board_w + (col - 1) * gap_x
-            x2 = x1 + gap_x
             add_lwpolyline_rect(
                 msp,
                 x1,
@@ -823,7 +855,6 @@ def create_real_panel_dxf_from_source(
                 "PANEL_ROUTE"
             )
 
-    # Tooling holes
     tooling_r = 1.6
     tooling_margin = max(rail_width / 2.0, 2.5)
 
@@ -832,7 +863,6 @@ def create_real_panel_dxf_from_source(
     add_circle(msp, tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
     add_circle(msp, panel_w - tooling_margin, panel_h - tooling_margin, tooling_r, "PANEL_TOOLING")
 
-    # Fiducial
     fid_r = 0.75
     fid_margin = max(rail_width, 3.0)
 
@@ -840,8 +870,8 @@ def create_real_panel_dxf_from_source(
     add_circle(msp, panel_w - fid_margin, panel_h - fid_margin, fid_r, "PANEL_FIDUCIAL")
     add_circle(msp, fid_margin, fid_margin, fid_r, "PANEL_FIDUCIAL")
 
-    # 文字說明
     text_y = panel_h + 8
+
     add_text(
         msp,
         f"Product: {product_name}",
@@ -887,7 +917,6 @@ def create_real_panel_dxf_from_source(
         "PANEL_TEXT"
     )
 
-    # 簡易尺寸線
     dim_offset = 6.0
 
     add_line(
@@ -1050,7 +1079,6 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
     local_input = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_source.dxf")
     download_file_from_minio(object_key, local_input)
 
-    # 如果原始 DXF 的實際尺寸可讀，優先用實際 DXF bounding box 產生候選方案
     detected_length = single_board_length
     detected_width = single_board_width
 
@@ -1151,6 +1179,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "geometry_mode": geometry_mode,
         "geometry_info": geometry_info,
         "best_candidate": candidate,
+        "display_candidates": result["display_candidates"],
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
         "message": "Panelized DXF generated by real DXF panelization engine."
@@ -1173,6 +1202,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str]) -> Dict[str, Any
         "api_download_url": api_download_url,
         "minio_presigned_url": minio_presigned_url,
         "best_candidate": candidate,
+        "display_candidates": result["display_candidates"],
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
         "geometry_info": geometry_info,
@@ -1210,6 +1240,7 @@ def merge_local_outputs_into_dify_result(
     outputs["fallback_download_url"] = local_outputs["download_url"]
     outputs["geometry_mode"] = local_outputs["geometry_mode"]
     outputs["geometry_info"] = local_outputs["geometry_info"]
+    outputs["display_candidates"] = local_outputs["display_candidates"]
 
     dify_result["data"]["outputs"] = outputs
 
@@ -1328,7 +1359,7 @@ async def generate_panel_candidates_from_minio(
         "product_name": product_name,
         "object_key": object_key,
         "stage": "phase_2_real_dxf_panelization",
-        "note": "已讀取 DXF bounding box，並產生所有候選連版方案。",
+        "note": "已讀取 DXF bounding box，並產生所有候選連版方案；報告僅顯示前三個 display_candidates。",
         "detected_single_board": {
             "length_mm": round(detected_length, 3),
             "width_mm": round(detected_width, 3)
@@ -1344,12 +1375,15 @@ async def generate_panel_candidates_from_minio(
             "ict_max_width": ict_max_width
         },
         "best_candidate": result["best_candidate"],
+        "display_candidates": result["display_candidates"],
         "all_candidates": result["all_candidates"],
         "candidates": result["candidates"],
         "recommended_candidates": result["recommended_candidates"],
         "caution_candidates": result["caution_candidates"],
         "not_recommended_candidates": result["not_recommended_candidates"],
-        "comparison_table_markdown": build_comparison_table_markdown(result["all_candidates"]),
+        "comparison_table_markdown": build_comparison_table_markdown(result["all_candidates"], limit=3),
+        "caution_and_not_recommended_summary": build_caution_and_not_summary(result["all_candidates"], limit=3),
+        "not_recommended_summary": build_caution_and_not_summary(result["all_candidates"], limit=3),
         "report_text": report_text,
         "report_markdown": report_text
     }
@@ -1431,7 +1465,6 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     local_outputs = None
 
     try:
-        # 先本地產生真實連版 DXF，確保無論 Dify 成敗都有檔案可以下載
         local_outputs = generate_local_panelization_outputs(inputs)
 
         if not DIFY_API_BASE or not DIFY_API_KEY:
@@ -1448,7 +1481,8 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_output_filename": local_outputs["output_filename"],
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
-                        "geometry_info": local_outputs["geometry_info"]
+                        "geometry_info": local_outputs["geometry_info"],
+                        "display_candidates": local_outputs["display_candidates"]
                     },
                     "warning": "Dify API environment variables are not configured, but local real DXF generation succeeded."
                 }
@@ -1509,7 +1543,8 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_output_filename": local_outputs["output_filename"],
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
-                        "geometry_info": local_outputs["geometry_info"]
+                        "geometry_info": local_outputs["geometry_info"],
+                        "display_candidates": local_outputs["display_candidates"]
                     },
                     "warning": "Dify workflow API failed, but local real DXF generation succeeded.",
                     "dify_error": response.text
@@ -1539,7 +1574,8 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                         "fallback_output_filename": local_outputs["output_filename"],
                         "fallback_download_url": local_outputs["download_url"],
                         "geometry_mode": local_outputs["geometry_mode"],
-                        "geometry_info": local_outputs["geometry_info"]
+                        "geometry_info": local_outputs["geometry_info"],
+                        "display_candidates": local_outputs["display_candidates"]
                     },
                     "warning": "Dify returned non-JSON response, but local real DXF generation succeeded.",
                     "dify_response_preview": response.text[:1500]
@@ -1706,7 +1742,8 @@ async def run_dify_panelization(
                 "fallback_output_filename": local_outputs["output_filename"],
                 "fallback_download_url": local_outputs["download_url"],
                 "geometry_mode": local_outputs["geometry_mode"],
-                "geometry_info": local_outputs["geometry_info"]
+                "geometry_info": local_outputs["geometry_info"],
+                "display_candidates": local_outputs["display_candidates"]
             }
         }
     }
