@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.3-me-template-detail-routertab-v091")
+app = FastAPI(title="PCB Panelization API", version="0.9.4-me-template-detail-edge-routertab")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ app.add_middleware(
 # =========================================================
 
 PANEL_RULES = {
-    "version": "company_panel_rules_v1.3_me_template_detail_routertab_v091",
+    "version": "company_panel_rules_v1.4_me_template_detail_edge_routertab",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -402,8 +402,8 @@ def sanitize_strategy(strategy: dict) -> dict:
         "layout": {
             "columns": max(1, safe_int_from_dict(layout, "columns", 1)),
             "rows": max(1, safe_int_from_dict(layout, "rows", 1)),
-            "gap_x_mm": max(0.0, safe_float_from_dict(layout, "gap_x_mm", default_gap)),
-            "gap_y_mm": max(0.0, safe_float_from_dict(layout, "gap_y_mm", default_gap)),
+            "gap_x_mm": max(PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0, safe_float_from_dict(layout, "gap_x_mm", default_gap)),
+            "gap_y_mm": max(PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0, safe_float_from_dict(layout, "gap_y_mm", default_gap)),
             "rail_left_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_left_mm", PANEL_RULES["rail"]["default_mm"])),
             "rail_right_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_right_mm", PANEL_RULES["rail"]["default_mm"])),
             "rail_top_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_top_mm", PANEL_RULES["rail"]["default_mm"])),
@@ -578,6 +578,12 @@ def apply_strategy_to_candidate(
 
     split_method = cutting_rule.get("method") or strategy.get("recommended_method") or candidate.get("split_method", "V-cut")
 
+    # ROUTE 各連板間距至少 2 mm 以上。
+    if "Router" in str(split_method) or "Tab" in str(split_method):
+        min_route_gap = PANEL_RULES["cutting"]["router_min_gap_mm"]
+        gap_x = max(gap_x, min_route_gap)
+        gap_y = max(gap_y, min_route_gap)
+
     panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
     panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
 
@@ -711,7 +717,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.3-me-template-detail-routertab-v091",
+        "version": "0.9.4-me-template-detail-edge-routertab",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
         "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white lines, rail policy, tab points, leader dimensions, fiducial and tooling hole callouts.",
@@ -1236,7 +1242,7 @@ def auto_determine_panel_features(
     )
 
     return {
-        "rule_version": "company_panel_feature_rule_v1.2_me_template_detail",
+        "rule_version": "company_panel_feature_rule_v1.4_me_template_detail_edge_routertab",
         "strategy_used": bool(strategy),
         "rule_source": PANEL_RULES["source"],
         "fiducials": fiducials,
@@ -1321,6 +1327,92 @@ def draw_edge_tabs(
             for ratio in [0.30, 0.70]:
                 x = bx + board_w * ratio
                 add_lwpolyline_rect(msp, x - tab_length / 2.0, by + board_h - tab_width / 2.0, tab_length, tab_width, layer)
+
+
+def draw_outer_edge_tabs(
+    msp,
+    panel_x0: float,
+    panel_y0: float,
+    rail_left: float,
+    rail_bottom: float,
+    board_w: float,
+    board_h: float,
+    pitch_x: float,
+    pitch_y: float,
+    columns: int,
+    rows: int,
+    tab_length: float,
+    tab_width: float,
+    layer: str = "PANEL_TAB",
+):
+    """
+    只在外側板邊與工藝邊交界處規劃 Router / Tab 連接點。
+
+    使用時機：
+    1. 保留上一版 v0.9.1 的板與板之間 Router / Tab 畫法。
+    2. 額外補上外側板邊 Tab 點。
+    3. 不重複畫內部 seam 的 Tab，避免格式變亂。
+    4. Tab 以白色線規劃，實際尺寸與切點間距需由 ME/CAM 最終確認。
+    """
+    ratios = [0.30, 0.70]
+
+    for row in range(rows):
+        by = panel_y0 + rail_bottom + row * pitch_y
+
+        # 左外側板邊：第一欄左側
+        bx_left = panel_x0 + rail_left
+        for ratio in ratios:
+            y = by + board_h * ratio
+            add_lwpolyline_rect(
+                msp,
+                bx_left - tab_width / 2.0,
+                y - tab_length / 2.0,
+                tab_width,
+                tab_length,
+                layer,
+            )
+
+        # 右外側板邊：最後一欄右側
+        bx_right = panel_x0 + rail_left + (columns - 1) * pitch_x + board_w
+        for ratio in ratios:
+            y = by + board_h * ratio
+            add_lwpolyline_rect(
+                msp,
+                bx_right - tab_width / 2.0,
+                y - tab_length / 2.0,
+                tab_width,
+                tab_length,
+                layer,
+            )
+
+    for col in range(columns):
+        bx = panel_x0 + rail_left + col * pitch_x
+
+        # 下外側板邊：第一列下側
+        by_bottom = panel_y0 + rail_bottom
+        for ratio in ratios:
+            x = bx + board_w * ratio
+            add_lwpolyline_rect(
+                msp,
+                x - tab_length / 2.0,
+                by_bottom - tab_width / 2.0,
+                tab_length,
+                tab_width,
+                layer,
+            )
+
+        # 上外側板邊：最後一列上側
+        by_top = panel_y0 + rail_bottom + (rows - 1) * pitch_y + board_h
+        for ratio in ratios:
+            x = bx + board_w * ratio
+            add_lwpolyline_rect(
+                msp,
+                x - tab_length / 2.0,
+                by_top - tab_width / 2.0,
+                tab_length,
+                tab_width,
+                layer,
+            )
 
 
 # =========================================================
@@ -1553,6 +1645,13 @@ def create_real_panel_dxf_from_source(
     gap_x = float(candidate.get("gap_x_mm", PANEL_RULES["cutting"]["router_min_gap_mm"]))
     gap_y = float(candidate.get("gap_y_mm", PANEL_RULES["cutting"]["router_min_gap_mm"]))
 
+    # ROUTE 各連板間距至少 2 mm 以上。
+    # 即使 Dify strategy_json 或 candidate 傳入較小 gap，Router / Tab 製程仍強制修正為公司規範最小值。
+    if "Router" in split_method or "Tab" in split_method:
+        min_route_gap = PANEL_RULES["cutting"]["router_min_gap_mm"]
+        gap_x = max(gap_x, min_route_gap)
+        gap_y = max(gap_y, min_route_gap)
+
     input_rail_left = float(candidate.get("rail_left_mm", PANEL_RULES["rail"]["default_mm"]))
     input_rail_right = float(candidate.get("rail_right_mm", PANEL_RULES["rail"]["default_mm"]))
     input_rail_top = float(candidate.get("rail_top_mm", PANEL_RULES["rail"]["default_mm"]))
@@ -1681,11 +1780,11 @@ def create_real_panel_dxf_from_source(
 
     # Router / Tab 或 V-cut
     # -----------------------------------------------------
-    # 依上一版 0.9.1 的 Router / Tab 畫法：
-    # 1. Router channel 只畫在板與板之間。
+    # 依上一版 0.9.1 的 Router / Tab 畫法作為內部 seam 基礎：
+    # 1. Router channel 畫在板與板之間。
     # 2. 垂直 seam：每片板邊放上下兩個 Tab。
     # 3. 水平 seam：每片板邊放左右兩個 Tab。
-    # 4. 不額外在外側板邊強制增加 edge tab，避免格式與上一版不同。
+    # 4. 另補外側板邊 Router / Tab 連接點，且 ROUTE 各連板間距至少 2 mm。
     # -----------------------------------------------------
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
@@ -1777,6 +1876,25 @@ def create_real_panel_dxf_from_source(
                     tab_width,
                     "PANEL_TAB",
                 )
+
+        # 外側板邊 Router / Tab 連接點：補上板邊與工藝邊交界處的 Tab。
+        # 內部 seam 仍維持上一版 v0.9.1 畫法。
+        draw_outer_edge_tabs(
+            msp=msp,
+            panel_x0=panel_x0,
+            panel_y0=panel_y0,
+            rail_left=rail_left,
+            rail_bottom=rail_bottom,
+            board_w=board_w,
+            board_h=board_h,
+            pitch_x=pitch_x,
+            pitch_y=pitch_y,
+            columns=columns,
+            rows=rows,
+            tab_length=tab_length,
+            tab_width=tab_width,
+            layer="PANEL_TAB",
+        )
 
     # Tooling Hole / Fiducial
     feature_result = auto_determine_panel_features(
@@ -1935,11 +2053,12 @@ def create_real_panel_dxf_from_source(
         "rail_policy": rail_policy,
         "split_method": split_method,
         "panel_features": shifted_feature_result,
-        "template_style": "ME_panel_drawing_template_v3_detail",
+        "template_style": "ME_panel_drawing_template_v4_detail_edge_routertab",
         "template_notes": {
             "white_line_planning": True,
             "rail_policy": rail_policy,
-            "edge_tabs": "board-to-board and board-to-rail tabs are drawn with white lines",
+            "edge_tabs": "board-to-board tabs keep v0.9.1 logic; board-to-rail outer edge tabs are added with white lines",
+            "route_gap_rule": "ROUTE 各連板間距至少 2.0 mm 以上",
             "leader_dimensions": "dimension leaders and callouts are added for tooling hole, fiducial, tab, rail and panel size",
             "tooling_hole_callout": tooling_callout,
             "fiducial_callout": fiducial_callout,
@@ -1991,6 +2110,13 @@ def create_simple_panel_dxf_fallback(
             add_lwpolyline_rect(msp, x, y, single_board_length, single_board_width, "PANEL_OUTLINE")
 
     split_method = candidate.get("split_method", "V-cut")
+
+    # ROUTE 各連板間距至少 2 mm 以上。
+    if "Router" in str(split_method) or "Tab" in str(split_method):
+        min_route_gap = PANEL_RULES["cutting"]["router_min_gap_mm"]
+        gap_x = max(gap_x, min_route_gap)
+        gap_y = max(gap_y, min_route_gap)
+
     tab_length = PANEL_RULES["tab"]["tab_length_mm"]
     tab_width = PANEL_RULES["tab"]["tab_width_mm"]
 
