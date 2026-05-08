@@ -19,6 +19,7 @@ import ezdxf
 from ezdxf import bbox
 from ezdxf.math import Matrix44
 
+
 app = FastAPI(title="PCB Panelization API", version="0.9.5-me-template-edge-profile")
 
 app.add_middleware(
@@ -28,6 +29,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================================================
 # 公司連板設計規範：程式內建規則庫
@@ -183,9 +185,11 @@ PANEL_RULES = {
     ],
 }
 
+
 # =========================================================
-# MinIO / Dify 環境變數 (同原始程式碼)
+# MinIO / Dify 環境變數
 # =========================================================
+
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
@@ -197,232 +201,511 @@ DIFY_API_KEY = os.getenv("DIFY_API_KEY", "")
 
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
 
+
 # =========================================================
-# 工具函數 (同原始程式碼省略...)
+# 共用工具
 # =========================================================
+
 def normalize_yes_no(value: str) -> str:
     v = str(value).strip().lower()
-    return "Yes" if v in ["yes", "true", "1", "是", "y"] else "No"
+    if v in ["yes", "true", "1", "是", "y"]:
+        return "Yes"
+    if v in ["no", "false", "0", "否", "n"]:
+        return "No"
+    return "No"
+
 
 def yes_no_to_bool(value: Any) -> bool:
     v = str(value).strip().lower()
     return v in ["yes", "true", "1", "是", "y"]
 
-def to_float(value: Any, default: float = 0.0) -> float:
-    try: return float(value)
-    except: return default
-
-def to_int(value: Any, default: int = 0) -> int:
-    try: return int(float(value))
-    except: return default
 
 def safe_filename_name(filename: str) -> str:
-    return re.sub(r'[\\/*?:"<>| ]', "_", filename)
+    return (
+        filename
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+        .replace(":", "_")
+        .replace("*", "_")
+        .replace("?", "_")
+        .replace('"', "_")
+        .replace("<", "_")
+        .replace(">", "_")
+        .replace("|", "_")
+    )
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def status_to_zh(status_code: str) -> str:
+    mapping = {
+        "recommended": "建議",
+        "use_with_caution": "謹慎使用",
+        "not_recommended": "不建議",
+    }
+    return mapping.get(status_code, status_code)
+
+
+def risk_level_zh(risk_score: int) -> str:
+    if risk_score >= 100:
+        return "高風險"
+    if risk_score >= 40:
+        return "中風險"
+    return "低風險"
+
+
+def reasons_to_text(reasons: List[str]) -> str:
+    if not reasons:
+        return "符合目前尺寸與製程限制，無明顯重大風險。"
+    return "；".join(reasons)
+
 
 def make_public_api_download_url(object_key: str) -> str:
     return f"/api/pcb/download?object_key={object_key}"
 
-# =========================================================
-# DXF 幾何工具強化
-# =========================================================
 
-def ensure_layer(doc, name: str, color: int = 7):
-    if name not in doc.layers:
-        doc.layers.add(name=name, color=color)
-    else:
-        doc.layers.get(name).dxf.color = color
+def select_display_candidates(candidates: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    status_priority = {
+        "recommended": 0,
+        "use_with_caution": 1,
+        "not_recommended": 2,
+    }
 
-def add_lwpolyline_rect(msp, x: float, y: float, w: float, h: float, layer: str):
-    msp.add_lwpolyline([(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)],
-                       dxfattribs={"layer": layer, "closed": True})
+    def sort_key(c):
+        aspect_delta = abs(float(c.get("aspect_ratio", 99)) - PANEL_RULES["layout"]["preferred_aspect_ratio"])
+        return (
+            status_priority.get(c.get("status_code", ""), 9),
+            -int(c.get("pcs_per_panel", 0)),
+            int(c.get("risk_score", 9999)),
+            aspect_delta,
+            float(c.get("panel_length_mm", 9999)) * float(c.get("panel_width_mm", 9999)),
+        )
 
-def add_line(msp, x1: float, y1: float, x2: float, y2: float, layer: str):
-    msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer})
+    return sorted(candidates, key=sort_key)[:limit]
 
-def add_circle(msp, x: float, y: float, r: float, layer: str):
-    msp.add_circle(center=(x, y), radius=r, dxfattribs={"layer": layer})
-
-def add_text(msp, text: str, x: float, y: float, height: float, layer: str):
-    msp.add_text(text, dxfattribs={"layer": layer, "height": height, "insert": (x, y)})
-
-def add_leader_callout(msp, start_x, start_y, elbow_x, elbow_y, text_x, text_y, text, layer, text_height=1.8):
-    msp.add_line((start_x, start_y), (elbow_x, elbow_y), dxfattribs={"layer": layer})
-    msp.add_line((elbow_x, elbow_y), (text_x - 1.0, text_y), dxfattribs={"layer": layer})
-    msp.add_line((text_x - 1.0, text_y), (text_x + 35.0, text_y), dxfattribs={"layer": layer})
-    add_text(msp, text, text_x, text_y + 0.8, text_height, layer)
-
-def add_dimension_line(msp, x1, y1, x2, y2, text, text_x, text_y, layer, text_height=1.8, extension=3.0):
-    msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer})
-    if abs(y2 - y1) < abs(x2 - x1):
-        msp.add_line((x1, y1-extension), (x1, y1+extension), dxfattribs={"layer": layer})
-        msp.add_line((x2, y2-extension), (x2, y2+extension), dxfattribs={"layer": layer})
-    else:
-        msp.add_line((x1-extension, y1), (x1+extension, y1), dxfattribs={"layer": layer})
-        msp.add_line((x2-extension, y2), (x2+extension, y2), dxfattribs={"layer": layer})
-    add_text(msp, text, text_x, text_y, text_height, layer)
 
 # =========================================================
-# 核心優化：白色板邊與連接點設計 (依照參考圖)
+# strategy_json 解析與程式規則策略
 # =========================================================
 
-def draw_outer_edge_tabs(
-    msp,
-    panel_x0: float,
-    panel_y0: float,
-    rail_left: float,
-    rail_bottom: float,
-    board_w: float,
-    board_h: float,
-    pitch_x: float,
-    pitch_y: float,
-    columns: int,
-    rows: int,
-    tab_length: float,
-    tab_width: float,
-    layer: str = "PANEL_EDGE_PROFILE",
-):
+def parse_strategy_json(strategy_json: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not strategy_json or not str(strategy_json).strip():
+        return None, None
+
+    raw = str(strategy_json).strip()
+    raw = raw.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+    raw = raw.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed, None
+        return None, "strategy_json parsed but is not an object"
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if match:
+        candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "extracted strategy_json is not an object"
+        except Exception as e:
+            return None, f"json.loads extracted object failed: {str(e)}"
+
+    return None, "strategy_json is not valid JSON"
+
+
+def determine_base_split_method(
+    has_bga_qfn: bool,
+    has_heavy_component: bool,
+    is_irregular_shape: bool,
+) -> str:
+    if is_irregular_shape or has_bga_qfn or has_heavy_component:
+        return "Router / Tab"
+    return "V-cut"
+
+
+def determine_rail_policy(
+    split_method: str,
+    has_bga_qfn: bool,
+    has_dip: bool,
+    has_heavy_component: bool,
+    is_irregular_shape: bool,
+    force_tooling_hole: bool = True,
+) -> str:
     """
-    根據參考圖優化：白色線條為板邊連接點設計方式。
-    在板邊與工藝邊接觸位置繪製 U 型 Profile，維持 PCB 主體邊緣原始顏色。
+    判斷板邊需要兩側或四側。
+
+    原則：
+    1. 若需要 Tooling Hole / Fiducial / Router Tab，採四邊工藝邊。
+    2. 若為異形板、BGA/QFN、DIP、重零件，採四邊工藝邊。
+    3. 只有簡單矩形板且 V-cut、無治具需求時，才可允許兩側工藝邊。
     """
-    min_gap = max(PANEL_RULES["cutting"]["router_min_gap_mm"], 2.0)
-    tab_w = max(tab_width, min_gap) 
-    tab_l = 7.0 # 連接橋寬度
+    if force_tooling_hole:
+        return "four_sides"
+    if "Router" in split_method or "Tab" in split_method:
+        return "four_sides"
+    if has_bga_qfn or has_dip or has_heavy_component or is_irregular_shape:
+        return "four_sides"
+    return "two_sides"
 
-    # 銑刀切入深度
-    v_depth = 5.0 
-    h_depth = 5.0
 
-    def draw_u_profile(points):
-        msp.add_lwpolyline(points, dxfattribs={"layer": layer, "closed": False})
+def sanitize_strategy(strategy: dict) -> dict:
+    if not isinstance(strategy, dict):
+        strategy = {}
 
-    for row in range(rows):
-        for col in range(columns):
-            bx = panel_x0 + rail_left + col * pitch_x
-            by = panel_y0 + rail_bottom + row * pitch_y
+    layout = strategy.get("layout") if isinstance(strategy.get("layout"), dict) else {}
+    fid = strategy.get("fiducial_rule") if isinstance(strategy.get("fiducial_rule"), dict) else {}
+    hole = strategy.get("tooling_hole_rule") if isinstance(strategy.get("tooling_hole_rule"), dict) else {}
+    cutting = strategy.get("cutting_rule") if isinstance(strategy.get("cutting_rule"), dict) else {}
 
-            # 1. 下側外邊緣 (Bottom Side)
-            if row == 0 and rail_bottom > 0:
-                for r in [0.25, 0.75]:
-                    cx = bx + board_w * r
-                    pts = [(cx - tab_l/2, by), (cx - tab_l/2, by - v_depth), 
-                           (cx + tab_l/2, by - v_depth), (cx + tab_l/2, by)]
-                    draw_u_profile(pts)
-                    add_line(msp, cx - tab_l/2, by - tab_w, cx + tab_l/2, by - tab_w, layer)
+    method = cutting.get("method") or strategy.get("recommended_method") or "Router / Tab"
+    if method not in ["V-cut", "V-CUT", "Router / Tab"]:
+        method = "Router / Tab"
 
-            # 2. 上側外邊緣 (Top Side)
-            if row == rows - 1:
-                edge_y = by + board_h
-                for r in [0.25, 0.75]:
-                    cx = bx + board_w * r
-                    pts = [(cx - tab_l/2, edge_y), (cx - tab_l/2, edge_y + v_depth), 
-                           (cx + tab_l/2, edge_y + v_depth), (cx + tab_l/2, edge_y)]
-                    draw_u_profile(pts)
-                    add_line(msp, cx - tab_l/2, edge_y + tab_w, cx + tab_l/2, edge_y + tab_w, layer)
+    if method == "V-CUT":
+        method = "V-cut"
 
-            # 3. 左側外邊緣 (Left Side)
-            if col == 0 and rail_left > 0:
-                for r in [0.25, 0.75]:
-                    cy = by + board_h * r
-                    pts = [(bx, cy - tab_l/2), (bx - h_depth, cy - tab_l/2), 
-                           (bx - h_depth, cy + tab_l/2), (bx, cy + tab_l/2)]
-                    draw_u_profile(pts)
-                    add_line(msp, bx - tab_w, cy - tab_l/2, bx - tab_w, cy + tab_l/2, layer)
+    default_gap = PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0
 
-            # 4. 右側外邊緣 (Right Side)
-            if col == columns - 1:
-                edge_x = bx + board_w
-                for r in [0.25, 0.75]:
-                    cy = by + board_h * r
-                    pts = [(edge_x, cy - tab_l/2), (edge_x + h_depth, cy - tab_l/2), 
-                           (edge_x + h_depth, cy + tab_l/2), (edge_x, cy + tab_l/2)]
-                    draw_u_profile(pts)
-                    add_line(msp, edge_x + tab_w, cy - tab_l/2, edge_x + tab_w, cy + tab_l/2, layer)
+    def safe_float_from_dict(d: dict, key: str, default: float) -> float:
+        try:
+            return float(d.get(key, default))
+        except Exception:
+            return default
 
-# =========================================================
-# DXF 產生引擎 (create_real_panel_dxf_from_source)
-# =========================================================
+    def safe_int_from_dict(d: dict, key: str, default: int) -> int:
+        try:
+            return int(float(d.get(key, default)))
+        except Exception:
+            return default
 
-def create_real_panel_dxf_from_source(
-    source_path: str,
-    output_path: str,
-    product_name: str,
-    single_board_length: float,
-    single_board_width: float,
-    rail_width: float,
-    candidate: Dict[str, Any],
-    has_bga_qfn: bool = False,
-    has_dip: bool = False,
-    has_heavy_component: bool = False,
-    is_irregular_shape: bool = False,
-    strategy: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    ME 連板圖產生器。
-    確保 PCB 原始邊界與元件維持黃色，板邊連接點使用白色線段繪製 U 型 Profile。
-    """
-    doc = ezdxf.readfile(source_path)
-    msp = doc.modelspace()
+    return {
+        "strategy_source": strategy.get("strategy_source") or PANEL_RULES["source"],
+        "recommended_method": method,
+        "layout": {
+            "columns": max(1, safe_int_from_dict(layout, "columns", 1)),
+            "rows": max(1, safe_int_from_dict(layout, "rows", 1)),
+            "gap_x_mm": max(PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0, safe_float_from_dict(layout, "gap_x_mm", default_gap)),
+            "gap_y_mm": max(PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0, safe_float_from_dict(layout, "gap_y_mm", default_gap)),
+            "rail_left_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_left_mm", PANEL_RULES["rail"]["default_mm"])),
+            "rail_right_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_right_mm", PANEL_RULES["rail"]["default_mm"])),
+            "rail_top_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_top_mm", PANEL_RULES["rail"]["default_mm"])),
+            "rail_bottom_mm": max(PANEL_RULES["rail"]["minimum_warning_mm"], safe_float_from_dict(layout, "rail_bottom_mm", PANEL_RULES["rail"]["default_mm"])),
+        },
+        "fiducial_rule": {
+            "count": max(2, safe_int_from_dict(fid, "count", PANEL_RULES["fiducial"]["panel_count"])),
+            "diameter_mm": safe_float_from_dict(fid, "diameter_mm", PANEL_RULES["fiducial"]["diameter_mm"]),
+            "clearance_mm": max(PANEL_RULES["fiducial"]["clearance_mm"], safe_float_from_dict(fid, "clearance_mm", PANEL_RULES["fiducial"]["clearance_mm"])),
+            "positions": fid.get("positions") if isinstance(fid.get("positions"), list) else PANEL_RULES["fiducial"]["positions"],
+            "reason": fid.get("reason") or "依程式內建公司連板規範，Panel 光學點採三點對角防呆配置。",
+        },
+        "tooling_hole_rule": {
+            "count": max(4, safe_int_from_dict(hole, "count", PANEL_RULES["tooling_hole"]["count"])),
+            "diameter_mm": safe_float_from_dict(hole, "diameter_mm", PANEL_RULES["tooling_hole"]["diameter_mm"]),
+            "clearance_mm": max(PANEL_RULES["tooling_hole"]["clearance_mm"], safe_float_from_dict(hole, "clearance_mm", PANEL_RULES["tooling_hole"]["clearance_mm"])),
+            "positions": hole.get("positions") if isinstance(hole.get("positions"), list) else PANEL_RULES["tooling_hole"]["positions"],
+            "reason": hole.get("reason") or "依程式內建公司連板規範，固定點採四點分布於對角四邊，並需由 ME/CAM 確認防呆距離。",
+        },
+        "cutting_rule": {
+            "method": method,
+            "reason": cutting.get("reason") or "依程式內建公司連板規範，異形板、BGA/QFN 或重零件優先採 Router / Tab。",
+        },
+        "risk_items": strategy.get("risk_items") if isinstance(strategy.get("risk_items"), list) else [],
+        "me_cam_check_items": strategy.get("me_cam_check_items") if isinstance(strategy.get("me_cam_check_items"), list) else PANEL_RULES["check_items"],
+    }
 
-    # 初始化白色層
-    white_layers = ["PANEL_OUTLINE", "PANEL_RAIL", "PANEL_EDGE_PROFILE", "PANEL_TAB", "PANEL_DIMENSION", "PANEL_TEXT"]
-    for layer_name in white_layers:
-        ensure_layer(doc, layer_name, 7)
 
-    # 取得原始單板尺寸
-    ext = bbox.extents(msp)
-    board_w = ext.extmax.x - ext.extmin.x if ext.has_data else single_board_length
-    board_h = ext.extmax.y - ext.extmin.y if ext.has_data else single_board_width
-    min_x, min_y = ext.extmin.x, ext.extmin.y
-
-    columns = int(candidate.get("columns", 1))
-    rows = int(candidate.get("rows", 1))
-    gap_x = float(candidate.get("gap_x_mm", 2.0))
-    gap_y = float(candidate.get("gap_y_mm", 2.0))
-    rail_left = float(candidate.get("rail_left_mm", 8.0))
-    rail_bottom = float(candidate.get("rail_bottom_mm", 8.0))
-    rail_top = rail_bottom
-    rail_right = rail_left
-
-    pitch_x = board_w + gap_x
-    pitch_y = board_h + gap_y
-    panel_w = rail_left + columns * board_w + max(columns-1, 0)*gap_x + rail_right
-    panel_h = rail_bottom + rows * board_h + max(rows-1, 0)*gap_y + rail_top
-
-    # 繪製面板區域
-    panel_x0, panel_y0 = 50.0, 50.0 # 偏移量避免重疊
-    add_lwpolyline_rect(msp, panel_x0, panel_y0, panel_w, panel_h, "PANEL_OUTLINE")
-
-    # 複製單板 (保持原始顏色/圖層)
-    original_entities = list(msp)
-    for row in range(rows):
-        for col in range(columns):
-            dx = panel_x0 + rail_left + col * pitch_x - min_x
-            dy = panel_y0 + rail_bottom + row * pitch_y - min_y
-            if row == 0 and col == 0:
-                # 第一片直接位移
-                m = Matrix44.translate(dx, dy, 0)
-                for e in original_entities: e.transform(m)
-                continue
-            
-            # 其餘複製
-            m = Matrix44.translate(dx, dy, 0)
-            for e in original_entities:
-                new_e = e.copy()
-                new_e.transform(m)
-                msp.add_entity(new_e)
-
-    # 繪製白色邊緣連接點 (Router Profile)
-    draw_outer_edge_tabs(
-        msp, panel_x0, panel_y0, rail_left, rail_bottom, board_w, board_h,
-        pitch_x, pitch_y, columns, rows, 7.0, 2.0, "PANEL_EDGE_PROFILE"
+def build_program_rule_strategy(
+    best_candidate: dict,
+    has_bga_qfn: bool,
+    has_dip: bool,
+    has_heavy_component: bool,
+    is_irregular_shape: bool,
+    input_rail_width: float,
+) -> dict:
+    method = determine_base_split_method(
+        has_bga_qfn=has_bga_qfn,
+        has_heavy_component=has_heavy_component,
+        is_irregular_shape=is_irregular_shape,
     )
 
-    doc.saveas(output_path)
-    return {"panel_width": panel_w, "panel_height": panel_h, "pcs": columns * rows}
+    gap = PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0
+    rail = max(input_rail_width, PANEL_RULES["rail"]["company_recommended_min_mm"])
+    rail_policy = determine_rail_policy(method, has_bga_qfn, has_dip, has_heavy_component, is_irregular_shape, force_tooling_hole=True)
+
+    risk_items = [
+        "光學點及工具孔需距離板邊 5 mm 以上。",
+        "單板之間距離不得超過 30 mm，避免 SMT Sensor 誤判。",
+        "板邊、連接點、光學點與定位點需以白色線規劃。",
+        "板邊需判斷兩側或四側；若需治具定位、Fiducial 或 Router Tab，採四邊工藝邊。",
+        "連板圖面需標註單板尺寸、連板尺寸與連板數。",
+        "MLCC 0805 以上若距板邊 5 mm 以內，應使用 Router 製程。",
+        "金手指周圍不可設計連接點和 V-CUT 線。",
+        "雙面零件排版需做讓位，零件側應朝外避免上件干涉。",
+        "正式投產前需由 ME / CAM 工程師確認 V-CUT、Router、Fiducial、Tooling Hole、Tab 連接點與分板應力。",
+    ]
+
+    if method == "Router / Tab":
+        risk_items.append("ROUTE 各切點間距至少 2 mm 以上，因銑刀直徑約 1.5 mm。")
+        risk_items.append("Router / Tab 時，連接點不可同時作郵票孔和 V-CUT 線。")
+    else:
+        risk_items.append("V-CUT 線路徑上不得有干涉零件。")
+        risk_items.append("零件與 V-CUT 線距離需大於 2 mm。")
+        risk_items.append("V-CUT 線邊 5 mm 內零件高度不可超過 10 mm。")
+        risk_items.append("V-CUT 深度需為 PCB 兩邊各 1/3，開槽角度需 30 度。")
+
+    if has_bga_qfn:
+        risk_items.append("有 BGA/QFN，需確認元件距分板邊界與 Fiducial 的安全距離，避免分板應力造成焊點裂紋。")
+
+    if has_dip:
+        risk_items.append("有 DIP，需確認波峰焊方向、錫流方向與治具需求。")
+
+    if has_heavy_component:
+        risk_items.append("有重零件，需評估過爐板彎、支撐治具與分板應力。")
+
+    if is_irregular_shape:
+        risk_items.append("異形板不建議直接使用 V-CUT，建議採 Router / Tab。")
+
+    strategy = {
+        "strategy_source": PANEL_RULES["source"],
+        "recommended_method": method,
+        "rail_policy": rail_policy,
+        "layout": {
+            "columns": int(best_candidate.get("columns", best_candidate.get("x_count", 1))),
+            "rows": int(best_candidate.get("rows", best_candidate.get("y_count", 1))),
+            "gap_x_mm": gap,
+            "gap_y_mm": gap,
+            "rail_left_mm": rail,
+            "rail_right_mm": rail,
+            "rail_top_mm": rail if rail_policy == "four_sides" else 0.0,
+            "rail_bottom_mm": rail if rail_policy == "four_sides" else 0.0,
+        },
+        "fiducial_rule": {
+            "count": PANEL_RULES["fiducial"]["panel_count"],
+            "diameter_mm": PANEL_RULES["fiducial"]["diameter_mm"],
+            "clearance_mm": PANEL_RULES["fiducial"]["clearance_mm"],
+            "positions": PANEL_RULES["fiducial"]["positions"],
+            "reason": "依程式內建公司連板規範，Panel 光學點採 3 點分布於對角並具防呆設計。",
+        },
+        "tooling_hole_rule": {
+            "count": PANEL_RULES["tooling_hole"]["count"],
+            "diameter_mm": PANEL_RULES["tooling_hole"]["diameter_mm"],
+            "clearance_mm": PANEL_RULES["tooling_hole"]["clearance_mm"],
+            "positions": PANEL_RULES["tooling_hole"]["positions"],
+            "reason": "依程式內建公司連板規範，固定點採 4 點分布於對角四邊，並由 ME/CAM 確認防呆距離。",
+        },
+        "cutting_rule": {
+            "method": method,
+            "reason": "依程式內建公司連板規範，異形板、BGA/QFN 或重零件優先採 Router / Tab；一般矩形板且無高風險元件時才可評估 V-CUT。",
+        },
+        "risk_items": risk_items,
+        "me_cam_check_items": PANEL_RULES["check_items"],
+    }
+
+    return sanitize_strategy(strategy)
 
 
+def get_strategy_for_backend(
+    strategy_json: str,
+    best_candidate: dict,
+    has_bga_qfn: bool,
+    has_dip: bool,
+    has_heavy_component: bool,
+    is_irregular_shape: bool,
+    input_rail_width: float,
+) -> Tuple[dict, bool, Optional[str]]:
+    parsed_strategy, parse_error = parse_strategy_json(strategy_json)
 
+    if parsed_strategy:
+        strategy = sanitize_strategy(parsed_strategy)
+        if not strategy.get("strategy_source"):
+            strategy["strategy_source"] = "dify_strategy_json"
+        return strategy, True, None
+
+    program_strategy = build_program_rule_strategy(
+        best_candidate=best_candidate,
+        has_bga_qfn=has_bga_qfn,
+        has_dip=has_dip,
+        has_heavy_component=has_heavy_component,
+        is_irregular_shape=is_irregular_shape,
+        input_rail_width=input_rail_width,
+    )
+
+    return program_strategy, True, parse_error
+
+
+def apply_strategy_to_candidate(
+    base_candidate: Dict[str, Any],
+    strategy: Optional[Dict[str, Any]],
+    board_w: float,
+    board_h: float,
+    default_rail_width: float,
+) -> Dict[str, Any]:
+    candidate = dict(base_candidate)
+
+    if not strategy:
+        return candidate
+
+    layout = strategy.get("layout", {})
+    cutting_rule = strategy.get("cutting_rule", {})
+
+    columns = max(1, to_int(layout.get("columns", candidate.get("columns", 1)), 1))
+    rows = max(1, to_int(layout.get("rows", candidate.get("rows", 1)), 1))
+    gap_x = max(0.0, to_float(layout.get("gap_x_mm", candidate.get("gap_x_mm", 0.0)), 0.0))
+    gap_y = max(0.0, to_float(layout.get("gap_y_mm", candidate.get("gap_y_mm", 0.0)), 0.0))
+
+    rail_left = max(0.0, to_float(layout.get("rail_left_mm", default_rail_width), default_rail_width))
+    rail_right = max(0.0, to_float(layout.get("rail_right_mm", default_rail_width), default_rail_width))
+    rail_top = max(0.0, to_float(layout.get("rail_top_mm", default_rail_width), default_rail_width))
+    rail_bottom = max(0.0, to_float(layout.get("rail_bottom_mm", default_rail_width), default_rail_width))
+
+    split_method = cutting_rule.get("method") or strategy.get("recommended_method") or candidate.get("split_method", "V-cut")
+
+    # ROUTE 各連板間距至少 2 mm 以上。
+    if "Router" in str(split_method) or "Tab" in str(split_method):
+        min_route_gap = PANEL_RULES["cutting"]["router_min_gap_mm"]
+        gap_x = max(gap_x, min_route_gap)
+        gap_y = max(gap_y, min_route_gap)
+
+    panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
+    panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
+
+    aspect_ratio = max(panel_w, panel_h) / max(min(panel_w, panel_h), 0.001)
+
+    candidate.update({
+        "panel_type": f"{columns}x{rows}",
+        "x_count": columns,
+        "y_count": rows,
+        "columns": columns,
+        "rows": rows,
+        "gap_x_mm": gap_x,
+        "gap_y_mm": gap_y,
+        "rail_left_mm": rail_left,
+        "rail_right_mm": rail_right,
+        "rail_top_mm": rail_top,
+        "rail_bottom_mm": rail_bottom,
+        "panel_length_mm": round(panel_w, 2),
+        "panel_width_mm": round(panel_h, 2),
+        "panel_size": f"{panel_w:.1f} x {panel_h:.1f} mm",
+        "pcs_per_panel": columns * rows,
+        "aspect_ratio": round(aspect_ratio, 2),
+        "split_method": split_method,
+        "rail_policy": strategy.get("rail_policy", "four_sides"),
+        "strategy_override_applied": True,
+        "strategy_source": strategy.get("strategy_source", PANEL_RULES["source"]),
+        "rule_source": PANEL_RULES["source"],
+    })
+
+    return candidate
+
+
+def update_result_with_strategy_candidate(result: Dict[str, Any], strategy_candidate: Dict[str, Any]) -> Dict[str, Any]:
+    updated = dict(result)
+    all_candidates = list(result.get("all_candidates", []))
+
+    updated["best_candidate"] = strategy_candidate
+
+    filtered = [
+        c for c in all_candidates
+        if c.get("panel_type") != strategy_candidate.get("panel_type")
+    ]
+
+    updated["display_candidates"] = [strategy_candidate] + select_display_candidates(filtered, limit=2)
+    updated["all_candidates"] = all_candidates
+    updated["candidates"] = all_candidates
+    return updated
+
+
+# =========================================================
+# MinIO 工具
+# =========================================================
+
+def get_minio_client() -> Minio:
+    if not MINIO_ENDPOINT:
+        raise HTTPException(status_code=500, detail="MINIO_ENDPOINT is not configured")
+    if not MINIO_ACCESS_KEY:
+        raise HTTPException(status_code=500, detail="MINIO_ACCESS_KEY is not configured")
+    if not MINIO_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="MINIO_SECRET_KEY is not configured")
+
+    endpoint = MINIO_ENDPOINT.replace("https://", "").replace("http://", "")
+
+    return Minio(
+        endpoint=endpoint,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE,
+    )
+
+
+def ensure_bucket_exists():
+    client = get_minio_client()
+    try:
+        found = client.bucket_exists(MINIO_BUCKET)
+        if not found:
+            client.make_bucket(MINIO_BUCKET)
+    except S3Error as e:
+        raise HTTPException(status_code=500, detail=f"MinIO bucket error: {str(e)}")
+
+
+def upload_file_to_minio(local_path: str, object_name: str, content_type: str = "application/dxf"):
+    ensure_bucket_exists()
+    client = get_minio_client()
+
+    try:
+        client.fput_object(
+            bucket_name=MINIO_BUCKET,
+            object_name=object_name,
+            file_path=local_path,
+            content_type=content_type,
+        )
+    except S3Error as e:
+        raise HTTPException(status_code=500, detail=f"MinIO upload error: {str(e)}")
+
+
+def download_file_from_minio(object_name: str, local_path: str):
+    ensure_bucket_exists()
+    client = get_minio_client()
+
+    try:
+        client.fget_object(
+            bucket_name=MINIO_BUCKET,
+            object_name=object_name,
+            file_path=local_path,
+        )
+    except S3Error as e:
+        raise HTTPException(status_code=404, detail=f"MinIO object not found or download failed: {str(e)}")
+
+
+def get_presigned_download_url(object_name: str, hours: int = 24) -> str:
+    ensure_bucket_exists()
+    client = get_minio_client()
+
+    try:
+        return client.presigned_get_object(
+            bucket_name=MINIO_BUCKET,
+            object_name=object_name,
+            expires=timedelta(hours=hours),
+        )
+    except S3Error as e:
+        raise HTTPException(status_code=500, detail=f"MinIO presigned url error: {str(e)}")
 
 
 # =========================================================
