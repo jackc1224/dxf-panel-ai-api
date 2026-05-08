@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.4-me-template-detail-edge-routertab")
+app = FastAPI(title="PCB Panelization API", version="0.9.5-me-template-edge-profile")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ app.add_middleware(
 # =========================================================
 
 PANEL_RULES = {
-    "version": "company_panel_rules_v1.4_me_template_detail_edge_routertab",
+    "version": "company_panel_rules_v1.5_me_template_edge_profile",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -100,7 +100,7 @@ PANEL_RULES = {
         "route_gap_mm": 2.0,
         "edge_tab_enabled": True,
         "edge_tab_count_per_board_edge": 2,
-        "edge_tab_note": "板與板之間及板邊工藝邊皆規劃 Tab 連接點；連接點以白色線標示，需由 ME/CAM 確認分板應力。",
+        "edge_tab_note": "板與板之間及 PCB edge side 與工藝邊交界處皆規劃 Router / Tab 連接點；外側板邊採白色 U 型 ROUTE 輪廓線，ROUTE 各連板間距至少 2 mm，需由 ME/CAM 確認分板應力。",
     },
 
     "dimension": {
@@ -717,7 +717,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.4-me-template-detail-edge-routertab",
+        "version": "0.9.5-me-template-edge-profile",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
         "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white lines, rail policy, tab points, leader dimensions, fiducial and tooling hole callouts.",
@@ -1037,6 +1037,16 @@ def add_lwpolyline_rect(msp, x: float, y: float, w: float, h: float, layer: str)
     )
 
 
+def add_lwpolyline_open(msp, points: List[Tuple[float, float]], layer: str):
+    """
+    畫開放式白色線段，用於 PCB edge side 的 U 型 ROUTE 輪廓與引線。
+    """
+    msp.add_lwpolyline(
+        points,
+        dxfattribs={"layer": layer, "closed": False},
+    )
+
+
 def add_line(msp, x1: float, y1: float, x2: float, y2: float, layer: str):
     msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer})
 
@@ -1346,73 +1356,113 @@ def draw_outer_edge_tabs(
     layer: str = "PANEL_TAB",
 ):
     """
-    只在外側板邊與工藝邊交界處規劃 Router / Tab 連接點。
+    PCB edge side 專用 Router / Tab 外側板邊輪廓。
 
-    使用時機：
-    1. 保留上一版 v0.9.1 的板與板之間 Router / Tab 畫法。
-    2. 額外補上外側板邊 Tab 點。
-    3. 不重複畫內部 seam 的 Tab，避免格式變亂。
-    4. Tab 以白色線規劃，實際尺寸與切點間距需由 ME/CAM 最終確認。
+    設計目的：
+    1. 讓 PCB 本體外緣維持原 DXF 黃色線條。
+    2. 工藝邊、板邊 Router / Tab 連接點以白色線條呈現。
+    3. 外側板邊不是畫小方塊，而是畫 U 型 ROUTE 輪廓，接近正式 ME 圖面的 PCB edge side 樣式。
+    4. ROUTE 各連板間距至少 2 mm；tab_width 也會強制不小於 2 mm。
+    5. 只畫最外側板邊，不重複畫內部 seam，內部 seam 維持 v0.9.1 的 Router / Tab 畫法。
     """
     ratios = [0.30, 0.70]
 
-    for row in range(rows):
-        by = panel_y0 + rail_bottom + row * pitch_y
+    min_gap = max(PANEL_RULES["cutting"]["router_min_gap_mm"], 2.0)
+    tab_w = max(tab_width, min_gap)
+    tab_l = max(tab_length, 7.0)
 
-        # 左外側板邊：第一欄左側
-        bx_left = panel_x0 + rail_left
-        for ratio in ratios:
-            y = by + board_h * ratio
-            add_lwpolyline_rect(
-                msp,
-                bx_left - tab_width / 2.0,
-                y - tab_length / 2.0,
-                tab_width,
-                tab_length,
-                layer,
-            )
+    # 伸入工藝邊的深度，避免超過 rail 區域，也避免太短看不出 U 型 ROUTE 輪廓。
+    vertical_depth = max(4.0, min(max(rail_bottom - 1.0, 4.0), 10.0))
+    horizontal_depth = max(4.0, min(max(rail_left - 1.0, 4.0), 10.0))
 
-        # 右外側板邊：最後一欄右側
-        bx_right = panel_x0 + rail_left + (columns - 1) * pitch_x + board_w
-        for ratio in ratios:
-            y = by + board_h * ratio
-            add_lwpolyline_rect(
-                msp,
-                bx_right - tab_width / 2.0,
-                y - tab_length / 2.0,
-                tab_width,
-                tab_length,
-                layer,
-            )
+    def draw_bottom_u(cx: float, edge_y: float):
+        half = tab_l / 2.0
+        y2 = edge_y - vertical_depth
+        add_lwpolyline_open(
+            msp,
+            [
+                (cx - half, edge_y),
+                (cx - half, y2),
+                (cx + half, y2),
+                (cx + half, edge_y),
+            ],
+            layer,
+        )
+        # 切點間距標記線，代表 ROUTE gap 至少 2 mm。
+        add_line(msp, cx - half, edge_y - tab_w, cx + half, edge_y - tab_w, layer)
 
+    def draw_top_u(cx: float, edge_y: float):
+        half = tab_l / 2.0
+        y2 = edge_y + vertical_depth
+        add_lwpolyline_open(
+            msp,
+            [
+                (cx - half, edge_y),
+                (cx - half, y2),
+                (cx + half, y2),
+                (cx + half, edge_y),
+            ],
+            layer,
+        )
+        add_line(msp, cx - half, edge_y + tab_w, cx + half, edge_y + tab_w, layer)
+
+    def draw_left_u(edge_x: float, cy: float):
+        half = tab_l / 2.0
+        x2 = edge_x - horizontal_depth
+        add_lwpolyline_open(
+            msp,
+            [
+                (edge_x, cy - half),
+                (x2, cy - half),
+                (x2, cy + half),
+                (edge_x, cy + half),
+            ],
+            layer,
+        )
+        add_line(msp, edge_x - tab_w, cy - half, edge_x - tab_w, cy + half, layer)
+
+    def draw_right_u(edge_x: float, cy: float):
+        half = tab_l / 2.0
+        x2 = edge_x + horizontal_depth
+        add_lwpolyline_open(
+            msp,
+            [
+                (edge_x, cy - half),
+                (x2, cy - half),
+                (x2, cy + half),
+                (edge_x, cy + half),
+            ],
+            layer,
+        )
+        add_line(msp, edge_x + tab_w, cy - half, edge_x + tab_w, cy + half, layer)
+
+    # 下外側：第一列 PCB 下邊與下工藝邊交界處
+    by_bottom = panel_y0 + rail_bottom
     for col in range(columns):
         bx = panel_x0 + rail_left + col * pitch_x
-
-        # 下外側板邊：第一列下側
-        by_bottom = panel_y0 + rail_bottom
         for ratio in ratios:
-            x = bx + board_w * ratio
-            add_lwpolyline_rect(
-                msp,
-                x - tab_length / 2.0,
-                by_bottom - tab_width / 2.0,
-                tab_length,
-                tab_width,
-                layer,
-            )
+            draw_bottom_u(bx + board_w * ratio, by_bottom)
 
-        # 上外側板邊：最後一列上側
-        by_top = panel_y0 + rail_bottom + (rows - 1) * pitch_y + board_h
+    # 上外側：最後一列 PCB 上邊與上工藝邊交界處
+    by_top = panel_y0 + rail_bottom + (rows - 1) * pitch_y + board_h
+    for col in range(columns):
+        bx = panel_x0 + rail_left + col * pitch_x
         for ratio in ratios:
-            x = bx + board_w * ratio
-            add_lwpolyline_rect(
-                msp,
-                x - tab_length / 2.0,
-                by_top - tab_width / 2.0,
-                tab_length,
-                tab_width,
-                layer,
-            )
+            draw_top_u(bx + board_w * ratio, by_top)
+
+    # 左外側：第一欄 PCB 左邊與左工藝邊交界處
+    bx_left = panel_x0 + rail_left
+    for row in range(rows):
+        by = panel_y0 + rail_bottom + row * pitch_y
+        for ratio in ratios:
+            draw_left_u(bx_left, by + board_h * ratio)
+
+    # 右外側：最後一欄 PCB 右邊與右工藝邊交界處
+    bx_right = panel_x0 + rail_left + (columns - 1) * pitch_x + board_w
+    for row in range(rows):
+        by = panel_y0 + rail_bottom + row * pitch_y
+        for ratio in ratios:
+            draw_right_u(bx_right, by + board_h * ratio)
 
 
 # =========================================================
@@ -1613,7 +1663,7 @@ def create_real_panel_dxf_from_source(
         "PANEL_OUTLINE", "PANEL_VCUT", "PANEL_ROUTE", "PANEL_TAB",
         "PANEL_TOOLING", "PANEL_FIDUCIAL", "PANEL_TEXT", "PANEL_NOTE",
         "PANEL_WARNING", "PANEL_DIMENSION", "PANEL_FRAME", "PANEL_TITLE",
-        "PANEL_RAIL", "PANEL_LEADER",
+        "PANEL_RAIL", "PANEL_LEADER", "PANEL_EDGE_PROFILE",
     ]
     for layer_name in white_layers:
         ensure_layer(doc, layer_name, 7)
@@ -1893,7 +1943,7 @@ def create_real_panel_dxf_from_source(
             rows=rows,
             tab_length=tab_length,
             tab_width=tab_width,
-            layer="PANEL_TAB",
+            layer="PANEL_EDGE_PROFILE",
         )
 
     # Tooling Hole / Fiducial
@@ -2053,11 +2103,11 @@ def create_real_panel_dxf_from_source(
         "rail_policy": rail_policy,
         "split_method": split_method,
         "panel_features": shifted_feature_result,
-        "template_style": "ME_panel_drawing_template_v4_detail_edge_routertab",
+        "template_style": "ME_panel_drawing_template_v5_edge_profile",
         "template_notes": {
             "white_line_planning": True,
             "rail_policy": rail_policy,
-            "edge_tabs": "board-to-board tabs keep v0.9.1 logic; board-to-rail outer edge tabs are added with white lines",
+            "edge_tabs": "board-to-board tabs keep v0.9.1 logic; outer PCB edge side uses white U-shaped ROUTE profile with minimum 2 mm route gap",
             "route_gap_rule": "ROUTE 各連板間距至少 2.0 mm 以上",
             "leader_dimensions": "dimension leaders and callouts are added for tooling hole, fiducial, tab, rail and panel size",
             "tooling_hole_callout": tooling_callout,
@@ -2597,7 +2647,7 @@ def download_from_minio(object_key: str):
 
 def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     JOB_STORE[job_id]["status"] = "running"
-    JOB_STORE[job_id]["message"] = "依公司連板規範產生 ME 模板連版 DXF 並執行 Dify Workflow..."
+    JOB_STORE[job_id]["message"] = "依公司連板規範產生 ME 模板板邊連接點連版 DXF 並執行 Dify Workflow..."
     JOB_STORE[job_id]["started_at"] = datetime.utcnow().isoformat()
 
     try:
@@ -2630,7 +2680,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "本地公司規範 ME 模板連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "本地公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2687,7 +2737,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 失敗，但公司規範 ME 模板連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 失敗，但公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2722,7 +2772,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但公司規範 ME 模板連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2739,14 +2789,14 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
             result_json["data"]["original_dify_status"] = "failed"
 
         JOB_STORE[job_id]["status"] = "success"
-        JOB_STORE[job_id]["message"] = "公司規範 ME 模板連版 DXF 已完成，Dify 結果已合併"
+        JOB_STORE[job_id]["message"] = "公司規範 ME 模板板邊連接點連版 DXF 已完成，Dify 結果已合併"
         JOB_STORE[job_id]["result"] = result_json
         JOB_STORE[job_id]["error"] = None
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
     except Exception as e:
         JOB_STORE[job_id]["status"] = "failed"
-        JOB_STORE[job_id]["message"] = "公司規範 ME 模板連版 DXF 產生失敗"
+        JOB_STORE[job_id]["message"] = "公司規範 ME 模板板邊連接點連版 DXF 產生失敗"
         JOB_STORE[job_id]["error"] = {"error_type": type(e).__name__, "error_detail": str(e), "traceback": traceback.format_exc()}
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
