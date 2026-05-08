@@ -2,15 +2,15 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
 import os
-import re
-import json
+import tempfile
 import uuid
 import shutil
-import tempfile
-import traceback
+from datetime import timedelta, datetime
 import requests
+import traceback
+import json
+import re
 
 from minio import Minio
 from minio.error import S3Error
@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.1-me-template-layout")
+app = FastAPI(title="PCB Panelization API", version="0.9.2-me-template-detail")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,8 +35,8 @@ app.add_middleware(
 # 公司連板設計規範：程式內建規則庫
 # =========================================================
 
-PANEL_RULES: Dict[str, Any] = {
-    "version": "company_panel_rules_v1.1_me_template",
+PANEL_RULES = {
+    "version": "company_panel_rules_v1.2_me_template_detail",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -52,16 +52,8 @@ PANEL_RULES: Dict[str, Any] = {
 
     "layout": {
         "candidate_patterns": [
-            (1, 1),
-            (1, 2),
-            (2, 1),
-            (2, 2),
-            (3, 1),
-            (1, 3),
-            (3, 2),
-            (2, 3),
-            (4, 1),
-            (1, 4),
+            (1, 1), (1, 2), (2, 1), (2, 2), (3, 1),
+            (1, 3), (3, 2), (2, 3), (4, 1), (1, 4),
         ],
         "preferred_aspect_ratio": 1.5,
         "near_square_min": 1.0,
@@ -77,6 +69,9 @@ PANEL_RULES: Dict[str, Any] = {
         "default_mm": 8.0,
         "minimum_warning_mm": 4.0,
         "f_line_keepout_mm": 10.0,
+        "four_side_required_when_tooling": True,
+        "two_side_allowed_for_simple_vcut": True,
+        "template_note": "依連板圖模板，若需 Tooling Hole / Fiducial / Router Tab，優先採四邊工藝邊；簡單 V-CUT 且無治具需求時才允許兩側工藝邊。",
     },
 
     "fiducial": {
@@ -91,12 +86,35 @@ PANEL_RULES: Dict[str, Any] = {
 
     "tooling_hole": {
         "count": 4,
-        "diameter_mm": 2.05,
-        "optional_jig_diameter_mm": 2.05,
+        "diameter_mm": 3.05,
+        "optional_jig_diameter_mm": 3.05,
         "clearance_mm": 5.0,
         "positions": ["bottom-left", "bottom-right", "top-left", "top-right"],
         "poka_yoke_offset_mm": 1.0,
-        "template_callout": "4-Ø2.05 ±0.05 Tooling hole",
+        "template_callout": "4-Ø3.05 ±0.05 Tooling hole",
+    },
+
+    "tab": {
+        "tab_length_mm": 7.0,
+        "tab_width_mm": 2.0,
+        "route_gap_mm": 2.0,
+        "edge_tab_enabled": True,
+        "edge_tab_count_per_board_edge": 2,
+        "edge_tab_note": "板與板之間及板邊工藝邊皆規劃 Tab 連接點；連接點以白色線標示，需由 ME/CAM 確認分板應力。",
+    },
+
+    "dimension": {
+        "leader_enabled": True,
+        "leader_text_height": 1.8,
+        "dimension_text_height": 1.8,
+        "callout_text_height": 1.8,
+        "dimension_offset_mm": 8.0,
+        "dimension_stack_gap_mm": 6.0,
+        "hole_position_reference_x_mm": 5.0,
+        "hole_position_reference_y_mm": 10.0,
+        "tooling_to_fiducial_distance_mm": 7.70,
+        "tooling_callout_offset_x_mm": 9.0,
+        "fiducial_callout_offset_y_mm": 5.0,
     },
 
     "white_marking": {
@@ -143,6 +161,7 @@ PANEL_RULES: Dict[str, Any] = {
         "Panel 光學點與工具孔距離板邊是否至少 5 mm。",
         "板邊是否有 4 點固定點分布於對角並具防呆設計。",
         "板邊是否有 3 點光學點分布於對角並具防呆設計。",
+        "板邊與連接點需以白色線規劃，並確認 Tab 位置與切點間距。",
         "是否加註 4.5 x 30 mm 或 5 x 30 mm 白框不塗滿 / 雷雕框。",
         "雙面零件排版是否有做讓位，零件側是否朝外避免上件干涉。",
         "零件是否重疊板邊，是否確認無干涉。",
@@ -187,7 +206,7 @@ JOB_STORE: Dict[str, Dict[str, Any]] = {}
 # 共用工具
 # =========================================================
 
-def normalize_yes_no(value: Any) -> str:
+def normalize_yes_no(value: str) -> str:
     v = str(value).strip().lower()
     if v in ["yes", "true", "1", "是", "y"]:
         return "Yes"
@@ -197,12 +216,14 @@ def normalize_yes_no(value: Any) -> str:
 
 
 def yes_no_to_bool(value: Any) -> bool:
-    return normalize_yes_no(value) == "Yes"
+    v = str(value).strip().lower()
+    return v in ["yes", "true", "1", "是", "y"]
 
 
 def safe_filename_name(filename: str) -> str:
     return (
-        filename.replace("/", "_")
+        filename
+        .replace("/", "_")
         .replace("\\", "_")
         .replace(" ", "_")
         .replace(":", "_")
@@ -320,6 +341,31 @@ def determine_base_split_method(
     return "V-cut"
 
 
+def determine_rail_policy(
+    split_method: str,
+    has_bga_qfn: bool,
+    has_dip: bool,
+    has_heavy_component: bool,
+    is_irregular_shape: bool,
+    force_tooling_hole: bool = True,
+) -> str:
+    """
+    判斷板邊需要兩側或四側。
+
+    原則：
+    1. 若需要 Tooling Hole / Fiducial / Router Tab，採四邊工藝邊。
+    2. 若為異形板、BGA/QFN、DIP、重零件，採四邊工藝邊。
+    3. 只有簡單矩形板且 V-cut、無治具需求時，才可允許兩側工藝邊。
+    """
+    if force_tooling_hole:
+        return "four_sides"
+    if "Router" in split_method or "Tab" in split_method:
+        return "four_sides"
+    if has_bga_qfn or has_dip or has_heavy_component or is_irregular_shape:
+        return "four_sides"
+    return "two_sides"
+
+
 def sanitize_strategy(strategy: dict) -> dict:
     if not isinstance(strategy, dict):
         strategy = {}
@@ -350,7 +396,7 @@ def sanitize_strategy(strategy: dict) -> dict:
         except Exception:
             return default
 
-    sanitized = {
+    return {
         "strategy_source": strategy.get("strategy_source") or PANEL_RULES["source"],
         "recommended_method": method,
         "layout": {
@@ -385,8 +431,6 @@ def sanitize_strategy(strategy: dict) -> dict:
         "me_cam_check_items": strategy.get("me_cam_check_items") if isinstance(strategy.get("me_cam_check_items"), list) else PANEL_RULES["check_items"],
     }
 
-    return sanitized
-
 
 def build_program_rule_strategy(
     best_candidate: dict,
@@ -404,15 +448,18 @@ def build_program_rule_strategy(
 
     gap = PANEL_RULES["cutting"]["router_min_gap_mm"] if method == "Router / Tab" else 0.0
     rail = max(input_rail_width, PANEL_RULES["rail"]["company_recommended_min_mm"])
+    rail_policy = determine_rail_policy(method, has_bga_qfn, has_dip, has_heavy_component, is_irregular_shape, force_tooling_hole=True)
 
     risk_items = [
         "光學點及工具孔需距離板邊 5 mm 以上。",
         "單板之間距離不得超過 30 mm，避免 SMT Sensor 誤判。",
+        "板邊、連接點、光學點與定位點需以白色線規劃。",
+        "板邊需判斷兩側或四側；若需治具定位、Fiducial 或 Router Tab，採四邊工藝邊。",
         "連板圖面需標註單板尺寸、連板尺寸與連板數。",
         "MLCC 0805 以上若距板邊 5 mm 以內，應使用 Router 製程。",
         "金手指周圍不可設計連接點和 V-CUT 線。",
         "雙面零件排版需做讓位，零件側應朝外避免上件干涉。",
-        "正式投產前需由 ME / CAM 工程師確認 V-CUT、Router、Fiducial、Tooling Hole 與分板應力。",
+        "正式投產前需由 ME / CAM 工程師確認 V-CUT、Router、Fiducial、Tooling Hole、Tab 連接點與分板應力。",
     ]
 
     if method == "Router / Tab":
@@ -426,16 +473,20 @@ def build_program_rule_strategy(
 
     if has_bga_qfn:
         risk_items.append("有 BGA/QFN，需確認元件距分板邊界與 Fiducial 的安全距離，避免分板應力造成焊點裂紋。")
+
     if has_dip:
         risk_items.append("有 DIP，需確認波峰焊方向、錫流方向與治具需求。")
+
     if has_heavy_component:
         risk_items.append("有重零件，需評估過爐板彎、支撐治具與分板應力。")
+
     if is_irregular_shape:
         risk_items.append("異形板不建議直接使用 V-CUT，建議採 Router / Tab。")
 
     strategy = {
         "strategy_source": PANEL_RULES["source"],
         "recommended_method": method,
+        "rail_policy": rail_policy,
         "layout": {
             "columns": int(best_candidate.get("columns", best_candidate.get("x_count", 1))),
             "rows": int(best_candidate.get("rows", best_candidate.get("y_count", 1))),
@@ -443,8 +494,8 @@ def build_program_rule_strategy(
             "gap_y_mm": gap,
             "rail_left_mm": rail,
             "rail_right_mm": rail,
-            "rail_top_mm": rail,
-            "rail_bottom_mm": rail,
+            "rail_top_mm": rail if rail_policy == "four_sides" else 0.0,
+            "rail_bottom_mm": rail if rail_policy == "four_sides" else 0.0,
         },
         "fiducial_rule": {
             "count": PANEL_RULES["fiducial"]["panel_count"],
@@ -550,6 +601,7 @@ def apply_strategy_to_candidate(
         "pcs_per_panel": columns * rows,
         "aspect_ratio": round(aspect_ratio, 2),
         "split_method": split_method,
+        "rail_policy": strategy.get("rail_policy", "four_sides"),
         "strategy_override_applied": True,
         "strategy_source": strategy.get("strategy_source", PANEL_RULES["source"]),
         "rule_source": PANEL_RULES["source"],
@@ -561,8 +613,14 @@ def apply_strategy_to_candidate(
 def update_result_with_strategy_candidate(result: Dict[str, Any], strategy_candidate: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(result)
     all_candidates = list(result.get("all_candidates", []))
+
     updated["best_candidate"] = strategy_candidate
-    filtered = [c for c in all_candidates if c.get("panel_type") != strategy_candidate.get("panel_type")]
+
+    filtered = [
+        c for c in all_candidates
+        if c.get("panel_type") != strategy_candidate.get("panel_type")
+    ]
+
     updated["display_candidates"] = [strategy_candidate] + select_display_candidates(filtered, limit=2)
     updated["all_candidates"] = all_candidates
     updated["candidates"] = all_candidates
@@ -653,10 +711,10 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.1-me-template-layout",
+        "version": "0.9.2-me-template-detail",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
-        "message": "Company panelization rules are embedded in backend. DXF generation uses ME template layout.",
+        "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white lines, rail policy, tab points, leader dimensions, fiducial and tooling hole callouts.",
     }
 
 
@@ -732,6 +790,7 @@ def calculate_candidates(
     has_heavy_component: bool,
     is_irregular_shape: bool,
 ) -> dict:
+
     candidates = []
 
     split_method = determine_base_split_method(
@@ -740,12 +799,26 @@ def calculate_candidates(
         is_irregular_shape=is_irregular_shape,
     )
 
+    rail_policy = determine_rail_policy(
+        split_method=split_method,
+        has_bga_qfn=has_bga_qfn,
+        has_dip=has_dip,
+        has_heavy_component=has_heavy_component,
+        is_irregular_shape=is_irregular_shape,
+        force_tooling_hole=True,
+    )
+
     gap = PANEL_RULES["cutting"]["router_min_gap_mm"] if split_method == "Router / Tab" else 0.0
     rail = max(rail_width, PANEL_RULES["rail"]["company_recommended_min_mm"])
 
     for x_count, y_count in PANEL_RULES["layout"]["candidate_patterns"]:
-        panel_length = rail + single_board_length * x_count + gap * max(x_count - 1, 0) + rail
-        panel_width = rail + single_board_width * y_count + gap * max(y_count - 1, 0) + rail
+        rail_left = rail
+        rail_right = rail
+        rail_top = rail if rail_policy == "four_sides" else 0.0
+        rail_bottom = rail if rail_policy == "four_sides" else 0.0
+
+        panel_length = rail_left + single_board_length * x_count + gap * max(x_count - 1, 0) + rail_right
+        panel_width = rail_bottom + single_board_width * y_count + gap * max(y_count - 1, 0) + rail_top
 
         pcs_per_panel = x_count * y_count
         aspect_ratio = max(panel_length, panel_width) / max(min(panel_length, panel_width), 0.001)
@@ -806,6 +879,8 @@ def calculate_candidates(
         if rail_width < PANEL_RULES["rail"]["company_recommended_min_mm"]:
             reasons.append(f"輸入工藝邊 {rail_width:.1f} mm 低於公司建議 8~10 mm，本系統已以 {rail:.1f} mm 進行保守設計。")
 
+        reasons.append(f"板邊策略：{rail_policy}；若需 Tooling Hole / Fiducial / Router Tab，採四邊工藝邊。")
+
         if risk_score >= 100:
             status_code = "not_recommended"
         elif risk_score >= 40:
@@ -821,10 +896,11 @@ def calculate_candidates(
             "rows": y_count,
             "gap_x_mm": gap,
             "gap_y_mm": gap,
-            "rail_left_mm": rail,
-            "rail_right_mm": rail,
-            "rail_top_mm": rail,
-            "rail_bottom_mm": rail,
+            "rail_left_mm": rail_left,
+            "rail_right_mm": rail_right,
+            "rail_top_mm": rail_top,
+            "rail_bottom_mm": rail_bottom,
+            "rail_policy": rail_policy,
             "panel_length_mm": round(panel_length, 2),
             "panel_width_mm": round(panel_width, 2),
             "panel_size": f"{panel_length:.1f} x {panel_width:.1f} mm",
@@ -871,8 +947,8 @@ def build_comparison_table_markdown(candidates: List[Dict[str, Any]], limit: int
     display_candidates = select_display_candidates(candidates, limit=limit)
 
     lines = []
-    lines.append("| 方案 | Panel 尺寸 | pcs/panel | 分板方式 | 風險分數 | 風險等級 | 狀態 | 建議原因 |")
-    lines.append("|---|---:|---:|---|---:|---|---|---|")
+    lines.append("| 方案 | Panel 尺寸 | pcs/panel | 分板方式 | 板邊策略 | 風險分數 | 風險等級 | 狀態 | 建議原因 |")
+    lines.append("|---|---:|---:|---|---|---:|---|---|---|")
 
     for c in display_candidates:
         lines.append(
@@ -880,6 +956,7 @@ def build_comparison_table_markdown(candidates: List[Dict[str, Any]], limit: int
             f"| {c['panel_size']} "
             f"| {c['pcs_per_panel']} "
             f"| {c['split_method']} "
+            f"| {c.get('rail_policy', 'four_sides')} "
             f"| {c['risk_score']} "
             f"| {c['risk_level_zh']} "
             f"| {c['status_zh']} "
@@ -891,7 +968,11 @@ def build_comparison_table_markdown(candidates: List[Dict[str, Any]], limit: int
 
 def build_caution_and_not_summary(candidates: List[Dict[str, Any]], limit: int = 3) -> str:
     display_candidates = select_display_candidates(candidates, limit=limit)
-    items = [c for c in display_candidates if c["status_code"] in ["use_with_caution", "not_recommended"]]
+
+    items = [
+        c for c in display_candidates
+        if c["status_code"] in ["use_with_caution", "not_recommended"]
+    ]
 
     if not items:
         return "本次顯示的前三個候選方案皆為建議方案，未出現謹慎使用或不建議方案。"
@@ -920,6 +1001,7 @@ def get_modelspace_bbox(doc) -> Optional[Tuple[float, float, float, float]]:
             return None
 
         return min_x, min_y, max_x, max_y
+
     except Exception:
         return None
 
@@ -928,6 +1010,8 @@ def ensure_layer(doc, name: str, color: int = 7):
     try:
         if name not in doc.layers:
             doc.layers.add(name=name, color=color)
+        else:
+            doc.layers.get(name).dxf.color = color
     except Exception:
         pass
 
@@ -969,8 +1053,52 @@ def add_text(msp, text: str, x: float, y: float, height: float, layer: str):
         pass
 
 
+def add_leader_callout(
+    msp,
+    start_x: float,
+    start_y: float,
+    elbow_x: float,
+    elbow_y: float,
+    text_x: float,
+    text_y: float,
+    text: str,
+    layer: str = "PANEL_DIMENSION",
+    text_height: float = 1.8,
+):
+    """以白色線建立引線標註：起點 -> 轉折點 -> 文字底線。"""
+    add_line(msp, start_x, start_y, elbow_x, elbow_y, layer)
+    add_line(msp, elbow_x, elbow_y, text_x - 1.0, text_y, layer)
+    add_line(msp, text_x - 1.0, text_y, text_x + max(35.0, len(text) * text_height * 1.7), text_y, layer)
+    add_text(msp, text, text_x, text_y + 0.8, text_height, layer)
+
+
+def add_dimension_line(
+    msp,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    text: str,
+    text_x: float,
+    text_y: float,
+    layer: str = "PANEL_DIMENSION",
+    text_height: float = 1.8,
+    extension: float = 3.0,
+):
+    """簡易尺寸線，含兩端輔助線與數值。"""
+    add_line(msp, x1, y1, x2, y2, layer)
+    if abs(y2 - y1) < abs(x2 - x1):
+        add_line(msp, x1, y1 - extension, x1, y1 + extension, layer)
+        add_line(msp, x2, y2 - extension, x2, y2 + extension, layer)
+    else:
+        add_line(msp, x1 - extension, y1, x1 + extension, y1, layer)
+        add_line(msp, x2 - extension, y2, x2 + extension, y2, layer)
+    add_text(msp, text, text_x, text_y, text_height, layer)
+
+
 def position_to_xy(position: str, panel_w: float, panel_h: float, margin: float) -> Tuple[float, float]:
     p = str(position).strip().lower()
+
     mapping = {
         "bottom-left": (margin, margin),
         "bottom-right": (panel_w - margin, margin),
@@ -986,6 +1114,7 @@ def position_to_xy(position: str, panel_w: float, panel_h: float, margin: float)
         "bottom-center": (panel_w / 2.0, margin),
         "center": (panel_w / 2.0, panel_h / 2.0),
     }
+
     return mapping.get(p, (margin, margin))
 
 
@@ -1020,6 +1149,7 @@ def auto_determine_panel_features(
     is_irregular_shape: bool = False,
     strategy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+
     warnings: List[str] = []
     notes: List[str] = []
 
@@ -1032,35 +1162,17 @@ def auto_determine_panel_features(
     if strategy and isinstance(strategy.get("tooling_hole_rule"), dict):
         tooling_hole_rule = strategy.get("tooling_hole_rule", {})
 
-    fiducial_diameter_mm = to_float(
-        fiducial_rule.get("diameter_mm", PANEL_RULES["fiducial"]["diameter_mm"]),
-        PANEL_RULES["fiducial"]["diameter_mm"],
-    )
+    fiducial_diameter_mm = to_float(fiducial_rule.get("diameter_mm", PANEL_RULES["fiducial"]["diameter_mm"]), PANEL_RULES["fiducial"]["diameter_mm"])
     fiducial_radius_mm = fiducial_diameter_mm / 2.0
-    fiducial_count = to_int(
-        fiducial_rule.get("count", PANEL_RULES["fiducial"]["panel_count"]),
-        PANEL_RULES["fiducial"]["panel_count"],
-    )
-    fiducial_clearance_mm = max(
-        PANEL_RULES["fiducial"]["clearance_mm"],
-        to_float(fiducial_rule.get("clearance_mm", PANEL_RULES["fiducial"]["clearance_mm"]), PANEL_RULES["fiducial"]["clearance_mm"]),
-    )
+    fiducial_count = to_int(fiducial_rule.get("count", PANEL_RULES["fiducial"]["panel_count"]), PANEL_RULES["fiducial"]["panel_count"])
+    fiducial_clearance_mm = max(PANEL_RULES["fiducial"]["clearance_mm"], to_float(fiducial_rule.get("clearance_mm", PANEL_RULES["fiducial"]["clearance_mm"]), PANEL_RULES["fiducial"]["clearance_mm"]))
 
-    tooling_hole_diameter_mm = to_float(
-        tooling_hole_rule.get("diameter_mm", PANEL_RULES["tooling_hole"]["diameter_mm"]),
-        PANEL_RULES["tooling_hole"]["diameter_mm"],
-    )
+    tooling_hole_diameter_mm = to_float(tooling_hole_rule.get("diameter_mm", PANEL_RULES["tooling_hole"]["diameter_mm"]), PANEL_RULES["tooling_hole"]["diameter_mm"])
     tooling_hole_radius_mm = tooling_hole_diameter_mm / 2.0
-    tooling_hole_count = to_int(
-        tooling_hole_rule.get("count", PANEL_RULES["tooling_hole"]["count"]),
-        PANEL_RULES["tooling_hole"]["count"],
-    )
-    tooling_clearance_mm = max(
-        PANEL_RULES["tooling_hole"]["clearance_mm"],
-        to_float(tooling_hole_rule.get("clearance_mm", PANEL_RULES["tooling_hole"]["clearance_mm"]), PANEL_RULES["tooling_hole"]["clearance_mm"]),
-    )
+    tooling_hole_count = to_int(tooling_hole_rule.get("count", PANEL_RULES["tooling_hole"]["count"]), PANEL_RULES["tooling_hole"]["count"])
+    tooling_clearance_mm = max(PANEL_RULES["tooling_hole"]["clearance_mm"], to_float(tooling_hole_rule.get("clearance_mm", PANEL_RULES["tooling_hole"]["clearance_mm"]), PANEL_RULES["tooling_hole"]["clearance_mm"]))
 
-    fiducial_count = max(2, fiducial_count)
+    fiducial_count = max(3, fiducial_count)
     tooling_hole_count = max(4, tooling_hole_count)
 
     tooling_margin = max(tooling_clearance_mm, rail_width / 2.0)
@@ -1071,34 +1183,27 @@ def auto_determine_panel_features(
 
     if rail_width < PANEL_RULES["rail"]["company_recommended_min_mm"]:
         warnings.append(f"工藝邊 {rail_width:.1f} mm 低於公司建議 8~10 mm，請 ME/CAM 確認是否需加寬。")
+
     if rail_width < fiducial_clearance_mm:
         warnings.append(f"工藝邊 {rail_width:.1f} mm 小於 Fiducial clearance {fiducial_clearance_mm:.1f} mm，需確認光學點距板邊。")
+
     if rail_width < tooling_clearance_mm:
         warnings.append(f"工藝邊 {rail_width:.1f} mm 小於 Tooling Hole clearance {tooling_clearance_mm:.1f} mm，需確認工具孔距板邊。")
+
     if has_bga_qfn:
         notes.append("有 BGA/QFN，需確認 Fiducial 是否足以支援高精度貼裝，並確認分板邊界安全距離。")
+
     if has_dip:
         notes.append("有 DIP，Tooling Hole 與治具定位需確認不干涉波峰焊治具與錫流方向。")
+
     if has_heavy_component:
         notes.append("有重零件，需確認定位孔與支撐治具是否足以降低過爐板彎。")
+
     if is_irregular_shape or "Router" in split_method or "Tab" in split_method:
         notes.append("異形板或 Router / Tab 分板時，Fiducial 與 Tooling Hole 優先放在 Panel 工藝邊。")
-    if fiducial_rule.get("reason"):
-        notes.append(f"Fiducial 策略原因：{fiducial_rule.get('reason')}")
-    if tooling_hole_rule.get("reason"):
-        notes.append(f"Tooling Hole 策略原因：{tooling_hole_rule.get('reason')}")
 
-    tooling_positions = normalize_positions(
-        tooling_hole_rule.get("positions"),
-        PANEL_RULES["tooling_hole"]["positions"],
-        tooling_hole_count,
-    )
-
-    fiducial_positions = normalize_positions(
-        fiducial_rule.get("positions"),
-        PANEL_RULES["fiducial"]["positions"],
-        fiducial_count,
-    )
+    tooling_positions = normalize_positions(tooling_hole_rule.get("positions"), PANEL_RULES["tooling_hole"]["positions"], tooling_hole_count)
+    fiducial_positions = normalize_positions(fiducial_rule.get("positions"), PANEL_RULES["fiducial"]["positions"], fiducial_count)
 
     tooling_holes = []
     for index, position in enumerate(tooling_positions):
@@ -1125,14 +1230,13 @@ def auto_determine_panel_features(
         })
 
     rule_summary = (
-        f"依程式內建公司連板規範產生：Panel 光學點 {len(fiducials)} 點，"
-        f"直徑 {fiducial_diameter_mm:.2f} mm；"
+        f"依程式內建公司連板規範產生：Panel 光學點 {len(fiducials)} 點，直徑 {fiducial_diameter_mm:.2f} mm；"
         f"Tooling Hole {len(tooling_holes)} 點，直徑 {tooling_hole_diameter_mm:.2f} mm；"
         f"距板邊 clearance 不低於 5.0 mm，並包含固定點防呆提醒。"
     )
 
     return {
-        "rule_version": "company_panel_feature_rule_v1.1_me_template",
+        "rule_version": "company_panel_feature_rule_v1.2_me_template_detail",
         "strategy_used": bool(strategy),
         "rule_source": PANEL_RULES["source"],
         "fiducials": fiducials,
@@ -1171,6 +1275,52 @@ def draw_panel_features(
         name = str(fid["name"])
         add_circle(msp, x, y, r, fiducial_layer)
         add_text(msp, name, x + r + 0.8, y + r + 0.8, 1.5, text_layer)
+
+
+def draw_edge_tabs(
+    msp,
+    panel_x0: float,
+    panel_y0: float,
+    rail_left: float,
+    rail_bottom: float,
+    board_w: float,
+    board_h: float,
+    pitch_x: float,
+    pitch_y: float,
+    columns: int,
+    rows: int,
+    tab_length: float,
+    tab_width: float,
+    layer: str = "PANEL_TAB",
+):
+    """
+    在板邊與工藝邊交界處規劃 Tab 點。
+    以白色線畫矩形 Tab，供 ME/CAM 檢查實際分板應力與切點間距。
+    """
+    for row in range(rows):
+        for col in range(columns):
+            bx = panel_x0 + rail_left + col * pitch_x
+            by = panel_y0 + rail_bottom + row * pitch_y
+
+            # 左側板邊 tab
+            for ratio in [0.30, 0.70]:
+                y = by + board_h * ratio
+                add_lwpolyline_rect(msp, bx - tab_width / 2.0, y - tab_length / 2.0, tab_width, tab_length, layer)
+
+            # 右側板邊 tab
+            for ratio in [0.30, 0.70]:
+                y = by + board_h * ratio
+                add_lwpolyline_rect(msp, bx + board_w - tab_width / 2.0, y - tab_length / 2.0, tab_width, tab_length, layer)
+
+            # 下側板邊 tab
+            for ratio in [0.30, 0.70]:
+                x = bx + board_w * ratio
+                add_lwpolyline_rect(msp, x - tab_length / 2.0, by - tab_width / 2.0, tab_length, tab_width, layer)
+
+            # 上側板邊 tab
+            for ratio in [0.30, 0.70]:
+                x = bx + board_w * ratio
+                add_lwpolyline_rect(msp, x - tab_length / 2.0, by + board_h - tab_width / 2.0, tab_length, tab_width, layer)
 
 
 # =========================================================
@@ -1220,6 +1370,7 @@ def build_strategy_summary_text(strategy: Optional[Dict[str, Any]], strategy_app
 - 策略套用狀態：已套用
 - 策略來源：{strategy.get("strategy_source", PANEL_RULES["source"])}
 - 程式規則版本：{PANEL_RULES["version"]}
+- 板邊策略：{strategy.get("rail_policy", "four_sides")}
 - 建議分板方式：{strategy.get("recommended_method", "")}
 - Layout：{json.dumps(strategy.get("layout", {}), ensure_ascii=False)}
 - Fiducial Rule：{json.dumps(strategy.get("fiducial_rule", {}), ensure_ascii=False)}
@@ -1232,7 +1383,9 @@ def build_strategy_summary_text(strategy: Optional[Dict[str, Any]], strategy_app
 - Dify strategy_json 解析錯誤：{strategy_parse_error}
 """.strip()
 
-    return "- 策略套用狀態：已套用程式內建公司規範"
+    return """
+- 策略套用狀態：已套用程式內建公司規範
+""".strip()
 
 
 def build_ai_report_markdown(
@@ -1255,7 +1408,6 @@ def build_ai_report_markdown(
         geometry_info = panel_dxf.get("geometry_info", {}) or {}
         panel_features = geometry_info.get("panel_features", {}) or {}
         feature_text = build_feature_summary_text(panel_features)
-
         dxf_info = f"""
 - 輸出 DXF 檔名：{panel_dxf.get("output_filename", "")}
 - 輸出 object_key：{panel_dxf.get("output_object_key", "")}
@@ -1278,6 +1430,7 @@ def build_ai_report_markdown(
 - 建議 Panel 尺寸：{best["panel_size"]}
 - 每 Panel 數量：{best["pcs_per_panel"]} pcs/panel
 - 建議分板方式：{best["split_method"]}
+- 板邊策略：{best.get("rail_policy", "four_sides")}
 - 風險分數：{best["risk_score"]}
 - 風險等級：{best["risk_level_zh"]}
 - 狀態：{best["status_zh"]}
@@ -1310,6 +1463,8 @@ def build_ai_report_markdown(
 ## 八、製程風險提醒
 
 - 光學點及工具孔需距離板邊 5 mm 以上。
+- 板邊需判斷兩側或四側；若需治具定位、Fiducial 或 Router Tab，採四邊工藝邊。
+- 板邊、連接點、光學點與定位點需以白色線規劃。
 - 板邊建議 8～10 mm，若輸入值較小，需由 ME/CAM 確認。
 - ROUTE 切點間距至少 2 mm 以上。
 - 零件與 V-CUT 線距離需大於 2 mm。
@@ -1324,7 +1479,7 @@ def build_ai_report_markdown(
 
 ## 十、輸出限制說明
 
-本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-CUT、Router、Fiducial、Tooling Hole、白色雷雕框、分板應力與正式 CAM 檔案。
+本階段輸出的 DXF 為 AI 建議版，正式投產前仍需 ME / CAM 工程師確認 V-CUT、Router、Fiducial、Tooling Hole、白色雷雕框、Tab 連接點、分板應力與正式 CAM 檔案。
 """
     return report.strip()
 
@@ -1349,26 +1504,29 @@ def create_real_panel_dxf_from_source(
 ) -> Dict[str, Any]:
     """
     ME 連板圖模板式 DXF 產生器。
-    不強制 2x2 或 3x2；排列方式仍然依 candidate 的系統建議結果。
+
+    本版重點：
+    1. 板邊判斷兩側或四側，若需 Tooling/Fiducial/Router Tab 則用四側。
+    2. 板邊、連接點、光學點、定位點、尺寸標註與引線皆用白色線規劃。
+    3. 板與板之間及板邊工藝邊皆畫 Tab 連接點。
+    4. 尺寸標註包含總長、單板寬、有效寬、總高、單板高、板邊距離、孔點引線。
+    5. Tooling Hole 與 Fiducial 具清楚引線標註。
     """
+
     doc = ezdxf.readfile(source_path)
     msp = doc.modelspace()
 
-    ensure_layer(doc, "PANEL_OUTLINE", 3)
-    ensure_layer(doc, "PANEL_VCUT", 1)
-    ensure_layer(doc, "PANEL_ROUTE", 2)
-    ensure_layer(doc, "PANEL_TAB", 2)
-    ensure_layer(doc, "PANEL_TOOLING", 5)
-    ensure_layer(doc, "PANEL_FIDUCIAL", 6)
-    ensure_layer(doc, "PANEL_TEXT", 7)
-    ensure_layer(doc, "PANEL_NOTE", 7)
-    ensure_layer(doc, "PANEL_WARNING", 1)
-    ensure_layer(doc, "PANEL_DIMENSION", 4)
-    ensure_layer(doc, "PANEL_FRAME", 7)
-    ensure_layer(doc, "PANEL_TITLE", 7)
+    # 所有新增規劃線一律使用白色線，符合使用者要求。
+    white_layers = [
+        "PANEL_OUTLINE", "PANEL_VCUT", "PANEL_ROUTE", "PANEL_TAB",
+        "PANEL_TOOLING", "PANEL_FIDUCIAL", "PANEL_TEXT", "PANEL_NOTE",
+        "PANEL_WARNING", "PANEL_DIMENSION", "PANEL_FRAME", "PANEL_TITLE",
+        "PANEL_RAIL", "PANEL_LEADER",
+    ]
+    for layer_name in white_layers:
+        ensure_layer(doc, layer_name, 7)
 
     detected_bbox = get_modelspace_bbox(doc)
-
     if detected_bbox:
         min_x, min_y, max_x, max_y = detected_bbox
         detected_board_w = max_x - min_x
@@ -1384,51 +1542,58 @@ def create_real_panel_dxf_from_source(
 
     columns = int(candidate.get("x_count", candidate.get("columns", 1)))
     rows = int(candidate.get("y_count", candidate.get("rows", 1)))
-
     split_method = str(candidate.get("split_method", "Router / Tab"))
+
+    rail_policy = str(candidate.get("rail_policy", "four_sides"))
+    if strategy:
+        rail_policy = str(strategy.get("rail_policy", rail_policy))
+    if rail_policy not in ["four_sides", "two_sides"]:
+        rail_policy = "four_sides"
 
     gap_x = float(candidate.get("gap_x_mm", PANEL_RULES["cutting"]["router_min_gap_mm"]))
     gap_y = float(candidate.get("gap_y_mm", PANEL_RULES["cutting"]["router_min_gap_mm"]))
 
-    rail_left = float(candidate.get("rail_left_mm", PANEL_RULES["rail"]["default_mm"]))
-    rail_right = float(candidate.get("rail_right_mm", PANEL_RULES["rail"]["default_mm"]))
-    rail_top = float(candidate.get("rail_top_mm", PANEL_RULES["rail"]["default_mm"]))
-    rail_bottom = float(candidate.get("rail_bottom_mm", PANEL_RULES["rail"]["default_mm"]))
+    input_rail_left = float(candidate.get("rail_left_mm", PANEL_RULES["rail"]["default_mm"]))
+    input_rail_right = float(candidate.get("rail_right_mm", PANEL_RULES["rail"]["default_mm"]))
+    input_rail_top = float(candidate.get("rail_top_mm", PANEL_RULES["rail"]["default_mm"]))
+    input_rail_bottom = float(candidate.get("rail_bottom_mm", PANEL_RULES["rail"]["default_mm"]))
+
+    min_template_rail = PANEL_RULES["rail"]["company_recommended_min_mm"]
+    rail_left = max(input_rail_left, min_template_rail)
+    rail_right = max(input_rail_right, min_template_rail)
+
+    if rail_policy == "four_sides":
+        rail_top = max(input_rail_top, min_template_rail)
+        rail_bottom = max(input_rail_bottom, min_template_rail)
+    else:
+        rail_top = 0.0
+        rail_bottom = 0.0
 
     pitch_x = board_w + gap_x
     pitch_y = board_h + gap_y
 
     panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
     panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
-
     pcs_per_panel = columns * rows
 
-    frame_w = max(panel_w + 150.0, 290.0)
-    frame_h = max(panel_h + 135.0, 220.0)
-
+    # 圖框空間，預留上方說明、右側引線、下方標題欄。
+    frame_w = max(panel_w + 190.0, 340.0)
+    frame_h = max(panel_h + 155.0, 240.0)
     frame_x0 = 0.0
     frame_y0 = 0.0
     frame_x1 = frame_x0 + frame_w
     frame_y1 = frame_y0 + frame_h
-
     inner_margin = 8.0
-    bottom_title_height = 30.0
+    bottom_title_height = 32.0
 
-    panel_x0 = frame_x0 + (frame_w - panel_w) / 2.0
-    panel_y0 = frame_y0 + bottom_title_height + 30.0
+    panel_x0 = frame_x0 + (frame_w - panel_w) / 2.0 - 12.0
+    panel_y0 = frame_y0 + bottom_title_height + 34.0
 
     original_entities = list(msp)
 
-    # 圖框
+    # 圖框與外框
     add_lwpolyline_rect(msp, frame_x0, frame_y0, frame_w, frame_h, "PANEL_FRAME")
-    add_lwpolyline_rect(
-        msp,
-        frame_x0 + inner_margin,
-        frame_y0 + inner_margin,
-        frame_w - inner_margin * 2,
-        frame_h - inner_margin * 2,
-        "PANEL_FRAME",
-    )
+    add_lwpolyline_rect(msp, frame_x0 + inner_margin, frame_y0 + inner_margin, frame_w - inner_margin * 2, frame_h - inner_margin * 2, "PANEL_FRAME")
 
     grid_count_x = 14
     grid_count_y = 8
@@ -1462,16 +1627,17 @@ def create_real_panel_dxf_from_source(
     add_text(msp, f"One piece={board_w:.2f} x {board_h:.2f} mm", center_note_x, note_top_y - 5.0, 2.0, "PANEL_NOTE")
     add_text(msp, f"Panel size={panel_w:.2f} x {panel_h:.2f} mm", center_note_x, note_top_y - 10.0, 2.0, "PANEL_NOTE")
     add_text(msp, f"{pcs_per_panel} pcs/panel", center_note_x, note_top_y - 15.0, 2.0, "PANEL_NOTE")
+    add_text(msp, f"Rail policy={rail_policy}", center_note_x, note_top_y - 20.0, 2.0, "PANEL_NOTE")
 
     process_text = "No V-CUT and stamp hole" if ("Router" in split_method or "Tab" in split_method) else "V-CUT process"
-    add_text(msp, process_text, center_note_x, note_top_y - 20.0, 2.0, "PANEL_NOTE")
+    add_text(msp, process_text, center_note_x, note_top_y - 25.0, 2.0, "PANEL_NOTE")
 
     add_text(msp, "PS: 判板或過爐方向之設定由製造建議為準", right_note_x, note_top_y, 1.8, "PANEL_WARNING")
     add_text(msp, "EQ：一條線或鋼網尺寸管制依製程檢核", right_note_x, note_top_y - 5.0, 1.8, "PANEL_WARNING")
-    add_text(msp, "PS 未標註之尺寸以實際工法確認", right_note_x, note_top_y - 12.0, 1.8, "PANEL_NOTE")
+    add_text(msp, "板邊、連接點、光學點、定位點皆以白色線規劃", right_note_x, note_top_y - 12.0, 1.8, "PANEL_NOTE")
     add_text(msp, "若採 ROUTE，不可製作 V-CUT 線和郵票孔", right_note_x, note_top_y - 17.0, 1.8, "PANEL_NOTE")
 
-    # 複製原始單板到 Panel 位置
+    # 複製原始單板
     base_dx = panel_x0 + rail_left - min_x
     base_dy = panel_y0 + rail_bottom - min_y
     base_matrix = Matrix44.translate(base_dx, base_dy, 0)
@@ -1494,8 +1660,18 @@ def create_real_panel_dxf_from_source(
                 except Exception:
                     continue
 
-    # Panel 外框與每片單板外框
+    # Panel 外框、工藝邊與每片單板外框
     add_lwpolyline_rect(msp, panel_x0, panel_y0, panel_w, panel_h, "PANEL_OUTLINE")
+
+    # 工藝邊邊界線：清楚標示四側或兩側。
+    if rail_left > 0:
+        add_line(msp, panel_x0 + rail_left, panel_y0, panel_x0 + rail_left, panel_y0 + panel_h, "PANEL_RAIL")
+    if rail_right > 0:
+        add_line(msp, panel_x0 + panel_w - rail_right, panel_y0, panel_x0 + panel_w - rail_right, panel_y0 + panel_h, "PANEL_RAIL")
+    if rail_top > 0:
+        add_line(msp, panel_x0, panel_y0 + panel_h - rail_top, panel_x0 + panel_w, panel_y0 + panel_h - rail_top, "PANEL_RAIL")
+    if rail_bottom > 0:
+        add_line(msp, panel_x0, panel_y0 + rail_bottom, panel_x0 + panel_w, panel_y0 + rail_bottom, "PANEL_RAIL")
 
     for row in range(rows):
         for col in range(columns):
@@ -1504,31 +1680,27 @@ def create_real_panel_dxf_from_source(
             add_lwpolyline_rect(msp, board_x, board_y, board_w, board_h, "PANEL_OUTLINE")
 
     # Router / Tab 或 V-cut
+    tab_length = PANEL_RULES["tab"]["tab_length_mm"]
+    tab_width = PANEL_RULES["tab"]["tab_width_mm"]
+
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
             x = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
             add_line(msp, x, panel_y0 + rail_bottom, x, panel_y0 + panel_h - rail_top, "PANEL_VCUT")
+
         for row in range(1, rows):
             y = panel_y0 + rail_bottom + row * board_h + (row - 0.5) * gap_y
             add_line(msp, panel_x0 + rail_left, y, panel_x0 + panel_w - rail_right, y, "PANEL_VCUT")
     else:
         router_gap = max(gap_x, PANEL_RULES["cutting"]["router_min_gap_mm"])
         route_width = max(router_gap, 2.0)
-        tab_length = 7.0
-        tab_width = 2.0
 
-        # 垂直板間 Router channel + tab
+        # 垂直板間 Router channel + Tab
         for col in range(1, columns):
             x_center = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
             x_route = x_center - route_width / 2.0
-            add_lwpolyline_rect(
-                msp,
-                x_route,
-                panel_y0 + rail_bottom,
-                route_width,
-                panel_h - rail_top - rail_bottom,
-                "PANEL_ROUTE",
-            )
+            add_lwpolyline_rect(msp, x_route, panel_y0 + rail_bottom, route_width, panel_h - rail_top - rail_bottom, "PANEL_ROUTE")
+
             for row in range(rows):
                 board_y = panel_y0 + rail_bottom + row * pitch_y
                 tab_y_1 = board_y + board_h * 0.30
@@ -1536,18 +1708,12 @@ def create_real_panel_dxf_from_source(
                 add_lwpolyline_rect(msp, x_center - tab_width / 2.0, tab_y_1 - tab_length / 2.0, tab_width, tab_length, "PANEL_TAB")
                 add_lwpolyline_rect(msp, x_center - tab_width / 2.0, tab_y_2 - tab_length / 2.0, tab_width, tab_length, "PANEL_TAB")
 
-        # 水平板間 Router channel + tab
+        # 水平板間 Router channel + Tab
         for row in range(1, rows):
             y_center = panel_y0 + rail_bottom + row * board_h + (row - 0.5) * gap_y
             y_route = y_center - route_width / 2.0
-            add_lwpolyline_rect(
-                msp,
-                panel_x0 + rail_left,
-                y_route,
-                panel_w - rail_left - rail_right,
-                route_width,
-                "PANEL_ROUTE",
-            )
+            add_lwpolyline_rect(msp, panel_x0 + rail_left, y_route, panel_w - rail_left - rail_right, route_width, "PANEL_ROUTE")
+
             for col in range(columns):
                 board_x = panel_x0 + rail_left + col * pitch_x
                 tab_x_1 = board_x + board_w * 0.30
@@ -1555,11 +1721,30 @@ def create_real_panel_dxf_from_source(
                 add_lwpolyline_rect(msp, tab_x_1 - tab_length / 2.0, y_center - tab_width / 2.0, tab_length, tab_width, "PANEL_TAB")
                 add_lwpolyline_rect(msp, tab_x_2 - tab_length / 2.0, y_center - tab_width / 2.0, tab_length, tab_width, "PANEL_TAB")
 
+    # 板邊與工藝邊 Tab 點。
+    if PANEL_RULES["tab"].get("edge_tab_enabled", True):
+        draw_edge_tabs(
+            msp=msp,
+            panel_x0=panel_x0,
+            panel_y0=panel_y0,
+            rail_left=rail_left,
+            rail_bottom=rail_bottom,
+            board_w=board_w,
+            board_h=board_h,
+            pitch_x=pitch_x,
+            pitch_y=pitch_y,
+            columns=columns,
+            rows=rows,
+            tab_length=tab_length,
+            tab_width=tab_width,
+            layer="PANEL_TAB",
+        )
+
     # Tooling Hole / Fiducial
     feature_result = auto_determine_panel_features(
         panel_w=panel_w,
         panel_h=panel_h,
-        rail_width=min(rail_left, rail_right, rail_top, rail_bottom),
+        rail_width=max(min(rail_left, rail_right, rail_top if rail_top > 0 else rail_left, rail_bottom if rail_bottom > 0 else rail_left), 0.0),
         columns=columns,
         rows=rows,
         split_method=split_method,
@@ -1571,7 +1756,6 @@ def create_real_panel_dxf_from_source(
     )
 
     shifted_feature_result = dict(feature_result)
-
     shifted_tooling_holes = []
     for hole in feature_result.get("tooling_holes", []):
         h = dict(hole)
@@ -1589,81 +1773,110 @@ def create_real_panel_dxf_from_source(
     shifted_feature_result["tooling_holes"] = shifted_tooling_holes
     shifted_feature_result["fiducials"] = shifted_fiducials
 
-    draw_panel_features(
-        msp=msp,
-        feature_result=shifted_feature_result,
-        tooling_layer="PANEL_TOOLING",
-        fiducial_layer="PANEL_FIDUCIAL",
-        text_layer="PANEL_TEXT",
-    )
+    draw_panel_features(msp=msp, feature_result=shifted_feature_result, tooling_layer="PANEL_TOOLING", fiducial_layer="PANEL_FIDUCIAL", text_layer="PANEL_TEXT")
 
-    # Tooling Hole / Fiducial Callout
-    callout_x = panel_x0 + panel_w - 35.0
-    callout_y = panel_y0 - 10.0
-    add_line(msp, callout_x, callout_y, callout_x + 22.0, callout_y - 15.0, "PANEL_DIMENSION")
-
-    tooling_callout = PANEL_RULES.get("tooling_hole", {}).get("template_callout", "4-Ø2.05 ±0.05 Tooling hole")
+    # 引線標註：以右下角附近一組 Tooling/Fiducial 為基準，類似模板。
+    tooling_callout = PANEL_RULES.get("tooling_hole", {}).get("template_callout", "4-Ø3.05 ±0.05 Tooling hole")
     fiducial_callout = PANEL_RULES.get("fiducial", {}).get("template_callout", "3-Ø1.5 Fiducial Mark")
 
-    add_text(msp, tooling_callout, callout_x + 24.0, callout_y - 15.0, 1.8, "PANEL_DIMENSION")
-    add_text(msp, fiducial_callout, callout_x + 24.0, callout_y - 20.0, 1.8, "PANEL_DIMENSION")
+    # 找右下 Tooling 與附近 Fiducial 做引線，找不到則用 panel 右下。
+    if shifted_tooling_holes:
+        th_ref = sorted(shifted_tooling_holes, key=lambda h: (float(h["x"]), -float(h["y"])), reverse=True)[0]
+        th_x = float(th_ref["x"])
+        th_y = float(th_ref["y"])
+    else:
+        th_x = panel_x0 + panel_w - 5.0
+        th_y = panel_y0 + 5.0
 
-    # 尺寸標註
+    if shifted_fiducials:
+        fd_ref = sorted(shifted_fiducials, key=lambda f: abs(float(f["x"]) - th_x) + abs(float(f["y"]) - th_y))[0]
+        fd_x = float(fd_ref["x"])
+        fd_y = float(fd_ref["y"])
+    else:
+        fd_x = th_x - 7.7
+        fd_y = th_y - 5.0
+
+    callout_text_x = min(th_x + 32.0, frame_x1 - 85.0)
+    callout_y1 = max(panel_y0 - 12.0, frame_y0 + 38.0)
+    callout_y2 = callout_y1 - 10.0
+
+    add_leader_callout(msp, th_x, th_y, th_x + 16.0, callout_y1, callout_text_x, callout_y1, tooling_callout, "PANEL_DIMENSION", 1.8)
+    add_leader_callout(msp, fd_x, fd_y, fd_x + 18.0, callout_y2, callout_text_x, callout_y2, fiducial_callout, "PANEL_DIMENSION", 1.8)
+
+    # 孔位細部尺寸標註，模擬 5.00 / 10.00 / 9.00 / 7.70。
+    add_dimension_line(msp, th_x, th_y, th_x, th_y + 10.0, "10.00", th_x + 2.0, th_y + 4.5, "PANEL_DIMENSION", 1.8)
+    add_dimension_line(msp, th_x - 5.0, th_y, th_x, th_y, "5.00", th_x - 4.0, th_y - 4.0, "PANEL_DIMENSION", 1.8)
+    add_dimension_line(msp, fd_x, fd_y, th_x, th_y, "7.70", (fd_x + th_x) / 2.0 - 3.0, (fd_y + th_y) / 2.0 + 2.0, "PANEL_DIMENSION", 1.8)
+    add_dimension_line(msp, fd_x, fd_y - 7.0, th_x, fd_y - 7.0, "9.00", (fd_x + th_x) / 2.0 - 3.0, fd_y - 10.0, "PANEL_DIMENSION", 1.8)
+
+    # 尺寸標註：總長、單板寬、有效寬、總高、單板高、工藝邊。
     dim_top_y = panel_y0 + panel_h + 8.0
     dim_top_y_2 = dim_top_y + 6.0
     dim_top_y_3 = dim_top_y + 12.0
     dim_left_x = panel_x0 - 10.0
-    dim_left_x_2 = dim_left_x - 6.0
+    dim_left_x_2 = dim_left_x - 7.0
 
-    add_line(msp, panel_x0, dim_top_y, panel_x0 + panel_w, dim_top_y, "PANEL_DIMENSION")
-    add_text(msp, f"{panel_w:.2f}", panel_x0 + panel_w / 2.0, dim_top_y + 1.5, 1.8, "PANEL_DIMENSION")
-
-    add_line(msp, panel_x0 + rail_left, dim_top_y_2, panel_x0 + rail_left + board_w, dim_top_y_2, "PANEL_DIMENSION")
-    add_text(msp, f"{board_w:.2f}", panel_x0 + rail_left + board_w / 2.0, dim_top_y_2 + 1.5, 1.8, "PANEL_DIMENSION")
-
+    add_dimension_line(msp, panel_x0, dim_top_y, panel_x0 + panel_w, dim_top_y, f"{panel_w:.2f}", panel_x0 + panel_w / 2.0, dim_top_y + 1.5, "PANEL_DIMENSION")
+    add_dimension_line(msp, panel_x0 + rail_left, dim_top_y_2, panel_x0 + rail_left + board_w, dim_top_y_2, f"{board_w:.2f}", panel_x0 + rail_left + board_w / 2.0, dim_top_y_2 + 1.5, "PANEL_DIMENSION")
     effective_w = columns * board_w + max(columns - 1, 0) * gap_x
-    add_line(msp, panel_x0 + rail_left, dim_top_y_3, panel_x0 + rail_left + effective_w, dim_top_y_3, "PANEL_DIMENSION")
-    add_text(msp, f"{effective_w:.2f}", panel_x0 + rail_left + effective_w / 2.0, dim_top_y_3 + 1.5, 1.8, "PANEL_DIMENSION")
+    add_dimension_line(msp, panel_x0 + rail_left, dim_top_y_3, panel_x0 + rail_left + effective_w, dim_top_y_3, f"{effective_w:.2f}", panel_x0 + rail_left + effective_w / 2.0, dim_top_y_3 + 1.5, "PANEL_DIMENSION")
 
-    add_line(msp, dim_left_x, panel_y0, dim_left_x, panel_y0 + panel_h, "PANEL_DIMENSION")
-    add_text(msp, f"{panel_h:.2f}", dim_left_x - 8.0, panel_y0 + panel_h / 2.0, 1.8, "PANEL_DIMENSION")
+    add_dimension_line(msp, dim_left_x, panel_y0, dim_left_x, panel_y0 + panel_h, f"{panel_h:.2f}", dim_left_x - 9.0, panel_y0 + panel_h / 2.0, "PANEL_DIMENSION")
+    add_dimension_line(msp, dim_left_x_2, panel_y0 + rail_bottom, dim_left_x_2, panel_y0 + rail_bottom + board_h, f"{board_h:.2f}", dim_left_x_2 - 10.0, panel_y0 + rail_bottom + board_h / 2.0, "PANEL_DIMENSION")
 
-    add_line(msp, dim_left_x_2, panel_y0 + rail_bottom, dim_left_x_2, panel_y0 + rail_bottom + board_h, "PANEL_DIMENSION")
-    add_text(msp, f"{board_h:.2f}", dim_left_x_2 - 8.0, panel_y0 + rail_bottom + board_h / 2.0, 1.8, "PANEL_DIMENSION")
+    # 工藝邊尺寸引線
+    if rail_left > 0:
+        add_dimension_line(msp, panel_x0, panel_y0 - 8.0, panel_x0 + rail_left, panel_y0 - 8.0, f"{rail_left:.2f}", panel_x0 + rail_left / 2.0 - 2.0, panel_y0 - 11.0, "PANEL_DIMENSION")
+    if rail_bottom > 0:
+        add_dimension_line(msp, panel_x0 - 18.0, panel_y0, panel_x0 - 18.0, panel_y0 + rail_bottom, f"{rail_bottom:.2f}", panel_x0 - 27.0, panel_y0 + rail_bottom / 2.0, "PANEL_DIMENSION")
 
-    add_text(msp, f"{rail_left:.2f}", panel_x0 + 2.0, panel_y0 - 6.0, 1.6, "PANEL_DIMENSION")
-    add_text(msp, f"{rail_bottom:.2f}", panel_x0 - 14.0, panel_y0 + 2.0, 1.6, "PANEL_DIMENSION")
+    # Tab 尺寸引線，放在第一個板間或第一片板邊。
+    tab_callout_x = panel_x0 + rail_left + board_w + gap_x / 2.0 if columns > 1 else panel_x0 + rail_left + board_w
+    tab_callout_y = panel_y0 + rail_bottom + board_h * 0.70
+    add_leader_callout(
+        msp,
+        tab_callout_x,
+        tab_callout_y,
+        tab_callout_x + 14.0,
+        tab_callout_y + 18.0,
+        tab_callout_x + 20.0,
+        tab_callout_y + 18.0,
+        f"TAB {tab_width:.2f} x {tab_length:.2f}, gap≥{PANEL_RULES['cutting']['router_min_gap_mm']:.2f}",
+        "PANEL_DIMENSION",
+        1.8,
+    )
 
     # 標題欄
-    title_w = 88.0
-    title_h = 22.0
+    title_w = 92.0
+    title_h = 24.0
     title_x = frame_x1 - inner_margin - title_w
     title_y = frame_y0 + inner_margin
 
     add_lwpolyline_rect(msp, title_x, title_y, title_w, title_h, "PANEL_TITLE")
-    add_line(msp, title_x, title_y + 5.5, title_x + title_w, title_y + 5.5, "PANEL_TITLE")
-    add_line(msp, title_x, title_y + 11.0, title_x + title_w, title_y + 11.0, "PANEL_TITLE")
-    add_line(msp, title_x, title_y + 16.5, title_x + title_w, title_y + 16.5, "PANEL_TITLE")
-    add_line(msp, title_x + 18.0, title_y, title_x + 18.0, title_y + title_h, "PANEL_TITLE")
-    add_line(msp, title_x + 50.0, title_y, title_x + 50.0, title_y + title_h, "PANEL_TITLE")
+    add_line(msp, title_x, title_y + 6.0, title_x + title_w, title_y + 6.0, "PANEL_TITLE")
+    add_line(msp, title_x, title_y + 12.0, title_x + title_w, title_y + 12.0, "PANEL_TITLE")
+    add_line(msp, title_x, title_y + 18.0, title_x + title_w, title_y + 18.0, "PANEL_TITLE")
+    add_line(msp, title_x + 20.0, title_y, title_x + 20.0, title_y + title_h, "PANEL_TITLE")
+    add_line(msp, title_x + 54.0, title_y, title_x + 54.0, title_y + title_h, "PANEL_TITLE")
 
-    add_text(msp, "DRAWN", title_x + 2.0, title_y + 17.5, 1.4, "PANEL_TITLE")
-    add_text(msp, "CHECK", title_x + 2.0, title_y + 12.0, 1.4, "PANEL_TITLE")
-    add_text(msp, "APPROVED", title_x + 2.0, title_y + 6.5, 1.4, "PANEL_TITLE")
+    add_text(msp, "DRAWN", title_x + 2.0, title_y + 19.0, 1.4, "PANEL_TITLE")
+    add_text(msp, "CHECK", title_x + 2.0, title_y + 13.0, 1.4, "PANEL_TITLE")
+    add_text(msp, "APPROVED", title_x + 2.0, title_y + 7.0, 1.4, "PANEL_TITLE")
     add_text(msp, "MODEL", title_x + 2.0, title_y + 1.0, 1.4, "PANEL_TITLE")
-    add_text(msp, product_name, title_x + 20.0, title_y + 1.0, 1.5, "PANEL_TITLE")
+    add_text(msp, product_name, title_x + 22.0, title_y + 1.0, 1.5, "PANEL_TITLE")
 
-    # 產圖資訊移到左下，不壓板子
+    # 產圖資訊移到左下，不壓板子。
     info_x = frame_x0 + inner_margin + 8.0
     info_y = frame_y0 + inner_margin + 12.0
     strategy_source = strategy.get("strategy_source", PANEL_RULES["source"]) if strategy else PANEL_RULES["source"]
 
-    add_text(msp, f"Product: {product_name}", info_x, info_y + 22.0, 1.7, "PANEL_TEXT")
-    add_text(msp, f"One piece: {board_w:.2f} x {board_h:.2f} mm", info_x, info_y + 17.5, 1.7, "PANEL_TEXT")
-    add_text(msp, f"Panel size: {panel_w:.2f} x {panel_h:.2f} mm", info_x, info_y + 13.0, 1.7, "PANEL_TEXT")
-    add_text(msp, f"{pcs_per_panel} pcs/panel, Layout: {columns} x {rows}, Split: {split_method}", info_x, info_y + 8.5, 1.7, "PANEL_TEXT")
-    add_text(msp, f"Fiducial: {len(shifted_fiducials)} pcs, Tooling Hole: {len(shifted_tooling_holes)} pcs", info_x, info_y + 4.0, 1.7, "PANEL_TEXT")
-    add_text(msp, f"Strategy used: True, Source: {strategy_source}", info_x, info_y - 0.5, 1.7, "PANEL_TEXT")
+    add_text(msp, f"Product: {product_name}", info_x, info_y + 26.0, 1.7, "PANEL_TEXT")
+    add_text(msp, f"One piece: {board_w:.2f} x {board_h:.2f} mm", info_x, info_y + 21.5, 1.7, "PANEL_TEXT")
+    add_text(msp, f"Panel size: {panel_w:.2f} x {panel_h:.2f} mm", info_x, info_y + 17.0, 1.7, "PANEL_TEXT")
+    add_text(msp, f"{pcs_per_panel} pcs/panel, Layout: {columns} x {rows}, Split: {split_method}", info_x, info_y + 12.5, 1.7, "PANEL_TEXT")
+    add_text(msp, f"Rail: {rail_policy}, L/R/T/B={rail_left:.2f}/{rail_right:.2f}/{rail_top:.2f}/{rail_bottom:.2f}", info_x, info_y + 8.0, 1.7, "PANEL_TEXT")
+    add_text(msp, f"Fiducial: {len(shifted_fiducials)} pcs, Tooling Hole: {len(shifted_tooling_holes)} pcs", info_x, info_y + 3.5, 1.7, "PANEL_TEXT")
+    add_text(msp, f"Strategy used: True, Source: {strategy_source}", info_x, info_y - 1.0, 1.7, "PANEL_TEXT")
 
     doc.saveas(output_path)
 
@@ -1681,15 +1894,17 @@ def create_real_panel_dxf_from_source(
         "rail_right_mm": rail_right,
         "rail_top_mm": rail_top,
         "rail_bottom_mm": rail_bottom,
+        "rail_policy": rail_policy,
         "split_method": split_method,
         "panel_features": shifted_feature_result,
-        "template_style": "ME_panel_drawing_template_v2",
+        "template_style": "ME_panel_drawing_template_v3_detail",
         "template_notes": {
-            "text_area": "top-left and top-center note area",
-            "frame": "outer frame, inner frame, grid ticks, title block",
+            "white_line_planning": True,
+            "rail_policy": rail_policy,
+            "edge_tabs": "board-to-board and board-to-rail tabs are drawn with white lines",
+            "leader_dimensions": "dimension leaders and callouts are added for tooling hole, fiducial, tab, rail and panel size",
             "tooling_hole_callout": tooling_callout,
             "fiducial_callout": fiducial_callout,
-            "router_tab": "tabs are placed on board-to-board boundaries with router gap",
             "candidate_layout": f"{columns}x{rows} is kept from system recommendation",
         },
     }
@@ -1708,22 +1923,17 @@ def create_simple_panel_dxf_fallback(
     is_irregular_shape: bool = False,
     strategy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+
     doc = ezdxf.new("R2010")
     msp = doc.modelspace()
 
-    ensure_layer(doc, "PANEL_OUTLINE", 3)
-    ensure_layer(doc, "PANEL_VCUT", 1)
-    ensure_layer(doc, "PANEL_ROUTE", 2)
-    ensure_layer(doc, "PANEL_TOOLING", 5)
-    ensure_layer(doc, "PANEL_FIDUCIAL", 6)
-    ensure_layer(doc, "PANEL_TEXT", 7)
+    for layer_name in ["PANEL_OUTLINE", "PANEL_VCUT", "PANEL_ROUTE", "PANEL_TAB", "PANEL_TOOLING", "PANEL_FIDUCIAL", "PANEL_TEXT", "PANEL_DIMENSION"]:
+        ensure_layer(doc, layer_name, 7)
 
     columns = int(candidate.get("x_count", 1))
     rows = int(candidate.get("y_count", 1))
-
     gap_x = float(candidate.get("gap_x_mm", 0.0))
     gap_y = float(candidate.get("gap_y_mm", 0.0))
-
     rail_left = float(candidate.get("rail_left_mm", rail_width))
     rail_right = float(candidate.get("rail_right_mm", rail_width))
     rail_top = float(candidate.get("rail_top_mm", rail_width))
@@ -1731,7 +1941,6 @@ def create_simple_panel_dxf_fallback(
 
     panel_w = rail_left + rail_right + single_board_length * columns + gap_x * max(columns - 1, 0)
     panel_h = rail_top + rail_bottom + single_board_width * rows + gap_y * max(rows - 1, 0)
-
     pitch_x = single_board_length + gap_x
     pitch_y = single_board_width + gap_y
 
@@ -1744,6 +1953,8 @@ def create_simple_panel_dxf_fallback(
             add_lwpolyline_rect(msp, x, y, single_board_length, single_board_width, "PANEL_OUTLINE")
 
     split_method = candidate.get("split_method", "V-cut")
+    tab_length = PANEL_RULES["tab"]["tab_length_mm"]
+    tab_width = PANEL_RULES["tab"]["tab_width_mm"]
 
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
@@ -1759,6 +1970,23 @@ def create_simple_panel_dxf_fallback(
         for row in range(1, rows):
             y1 = rail_bottom + row * single_board_width + (row - 1) * gap_y
             add_lwpolyline_rect(msp, rail_left, y1, panel_w - rail_left - rail_right, max(gap_y, 0.3), "PANEL_ROUTE")
+
+    draw_edge_tabs(
+        msp=msp,
+        panel_x0=0,
+        panel_y0=0,
+        rail_left=rail_left,
+        rail_bottom=rail_bottom,
+        board_w=single_board_length,
+        board_h=single_board_width,
+        pitch_x=pitch_x,
+        pitch_y=pitch_y,
+        columns=columns,
+        rows=rows,
+        tab_length=tab_length,
+        tab_width=tab_width,
+        layer="PANEL_TAB",
+    )
 
     feature_result = auto_determine_panel_features(
         panel_w=panel_w,
@@ -1777,13 +2005,11 @@ def create_simple_panel_dxf_fallback(
     draw_panel_features(msp=msp, feature_result=feature_result)
 
     strategy_source = strategy.get("strategy_source", PANEL_RULES["source"]) if strategy else PANEL_RULES["source"]
-
     add_text(msp, f"Product: {product_name}", 0, panel_h + 8, 2.5, "PANEL_TEXT")
     add_text(msp, f"Panel: {columns} x {rows}, {columns * rows} pcs", 0, panel_h + 4, 2.5, "PANEL_TEXT")
     add_text(msp, f"Fiducial: {feature_result.get('fiducial_count')} pcs, Tooling Hole: {feature_result.get('tooling_hole_count')} pcs", 0, panel_h, 2.5, "PANEL_TEXT")
     add_text(msp, f"Strategy used: True, Source: {strategy_source}", 0, panel_h - 4, 2.5, "PANEL_TEXT")
     add_text(msp, f"Program rule: {PANEL_RULES['version']}", 0, panel_h - 8, 2.5, "PANEL_TEXT")
-    add_text(msp, "Fallback simple panel DXF. Source geometry was not copied.", 0, panel_h - 12, 2.5, "PANEL_TEXT")
 
     doc.saveas(output_path)
 
@@ -1887,7 +2113,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str], strategy_json: s
     output_name = f"panelized_{safe_name}_{candidate['panel_type']}_real.dxf"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_name}")
 
-    geometry_info: Dict[str, Any] = {}
+    geometry_info = {}
 
     try:
         geometry_info = create_real_panel_dxf_from_source(
@@ -1904,7 +2130,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str], strategy_json: s
             is_irregular_shape=is_irregular_shape,
             strategy=strategy,
         )
-        geometry_mode = "real_source_dxf_copied_me_template"
+        geometry_mode = "real_source_dxf_copied_me_template_detail"
     except Exception as e:
         geometry_info = create_simple_panel_dxf_fallback(
             output_path=output_path,
@@ -1928,6 +2154,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str], strategy_json: s
         pass
 
     output_object_key = f"outputs/{uuid.uuid4()}/{output_name}"
+
     upload_file_to_minio(local_path=output_path, object_name=output_object_key, content_type="application/dxf")
 
     try:
@@ -1960,7 +2187,7 @@ def generate_local_panelization_outputs(inputs: Dict[str, str], strategy_json: s
         "strategy_parse_error": strategy_parse_error,
         "program_rules_applied": True,
         "program_rule_version": PANEL_RULES["version"],
-        "message": "Panelized DXF generated by real DXF panelization engine with embedded company panel rules and ME template layout.",
+        "message": "Panelized DXF generated by real DXF panelization engine with embedded company panel rules and detailed ME template layout.",
     }
 
     report_text = build_ai_report_markdown(
@@ -2000,10 +2227,8 @@ def generate_local_panelization_outputs(inputs: Dict[str, str], strategy_json: s
 def merge_local_outputs_into_dify_result(dify_result: Dict[str, Any], local_outputs: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(dify_result, dict):
         dify_result = {}
-
     if "data" not in dify_result or not isinstance(dify_result.get("data"), dict):
         dify_result["data"] = {}
-
     if "outputs" not in dify_result["data"] or not isinstance(dify_result["data"].get("outputs"), dict):
         dify_result["data"]["outputs"] = {}
 
@@ -2126,14 +2351,8 @@ async def generate_panel_candidates_from_minio(
         "object_key": object_key,
         "stage": "program_rule_base_panelization",
         "note": "已讀取 DXF bounding box，並依程式內建公司連板規範產生候選方案。",
-        "detected_single_board": {
-            "length_mm": round(detected_length, 3),
-            "width_mm": round(detected_width, 3),
-        },
-        "input_single_board": {
-            "length_mm": single_board_length,
-            "width_mm": single_board_width,
-        },
+        "detected_single_board": {"length_mm": round(detected_length, 3), "width_mm": round(detected_width, 3)},
+        "input_single_board": {"length_mm": single_board_length, "width_mm": single_board_width},
         "machine_limits": {
             "smt_max_length": smt_max_length,
             "smt_max_width": smt_max_width,
@@ -2205,12 +2424,7 @@ async def generate_panel_dxf_from_minio(
 def download_from_minio(object_key: str):
     local_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{os.path.basename(object_key)}")
     download_file_from_minio(object_key, local_path)
-
-    return FileResponse(
-        local_path,
-        media_type="application/dxf",
-        filename=os.path.basename(object_key),
-    )
+    return FileResponse(local_path, media_type="application/dxf", filename=os.path.basename(object_key))
 
 
 # =========================================================
@@ -2369,11 +2583,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     except Exception as e:
         JOB_STORE[job_id]["status"] = "failed"
         JOB_STORE[job_id]["message"] = "公司規範 ME 模板連版 DXF 產生失敗"
-        JOB_STORE[job_id]["error"] = {
-            "error_type": type(e).__name__,
-            "error_detail": str(e),
-            "traceback": traceback.format_exc(),
-        }
+        JOB_STORE[job_id]["error"] = {"error_type": type(e).__name__, "error_detail": str(e), "traceback": traceback.format_exc()}
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
 
@@ -2395,7 +2605,6 @@ async def start_dify_job(
     is_irregular_shape: str = Form("No"),
 ):
     job_id = str(uuid.uuid4())
-
     inputs = {
         "object_key": object_key,
         "product_name": product_name,
@@ -2411,7 +2620,6 @@ async def start_dify_job(
         "has_heavy_component": has_heavy_component,
         "is_irregular_shape": is_irregular_shape,
     }
-
     JOB_STORE[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -2423,9 +2631,7 @@ async def start_dify_job(
         "result": None,
         "error": None,
     }
-
     background_tasks.add_task(run_dify_job_background, job_id, inputs)
-
     return {"status": "accepted", "job_id": job_id, "message": "Dify Workflow background job started."}
 
 
@@ -2469,12 +2675,10 @@ async def run_dify_panelization(
         "has_heavy_component": has_heavy_component,
         "is_irregular_shape": is_irregular_shape,
     }
-
     local_outputs = generate_local_panelization_outputs(inputs, strategy_json=strategy_json)
-
     return {
         "status": "success",
-        "message": "Synchronous API used real DXF panelization output with embedded company panel rules and ME template layout.",
+        "message": "Synchronous API used real DXF panelization output with embedded company panel rules and detailed ME template layout.",
         "data": {
             "outputs": {
                 "report_text": local_outputs["report_text"],
