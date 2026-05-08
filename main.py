@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.2-me-template-detail")
+app = FastAPI(title="PCB Panelization API", version="0.9.3-me-template-detail-routertab-v091")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ app.add_middleware(
 # =========================================================
 
 PANEL_RULES = {
-    "version": "company_panel_rules_v1.2_me_template_detail",
+    "version": "company_panel_rules_v1.3_me_template_detail_routertab_v091",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -711,7 +711,7 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.2-me-template-detail",
+        "version": "0.9.3-me-template-detail-routertab-v091",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
         "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white lines, rail policy, tab points, leader dimensions, fiducial and tooling hole callouts.",
@@ -1680,9 +1680,13 @@ def create_real_panel_dxf_from_source(
             add_lwpolyline_rect(msp, board_x, board_y, board_w, board_h, "PANEL_OUTLINE")
 
     # Router / Tab 或 V-cut
-    tab_length = PANEL_RULES["tab"]["tab_length_mm"]
-    tab_width = PANEL_RULES["tab"]["tab_width_mm"]
-
+    # -----------------------------------------------------
+    # 依上一版 0.9.1 的 Router / Tab 畫法：
+    # 1. Router channel 只畫在板與板之間。
+    # 2. 垂直 seam：每片板邊放上下兩個 Tab。
+    # 3. 水平 seam：每片板邊放左右兩個 Tab。
+    # 4. 不額外在外側板邊強制增加 edge tab，避免格式與上一版不同。
+    # -----------------------------------------------------
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
             x = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
@@ -1695,50 +1699,84 @@ def create_real_panel_dxf_from_source(
         router_gap = max(gap_x, PANEL_RULES["cutting"]["router_min_gap_mm"])
         route_width = max(router_gap, 2.0)
 
-        # 垂直板間 Router channel + Tab
+        tab_length = 7.0
+        tab_width = 2.0
+
+        # 垂直板間 Router channel
         for col in range(1, columns):
             x_center = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
             x_route = x_center - route_width / 2.0
-            add_lwpolyline_rect(msp, x_route, panel_y0 + rail_bottom, route_width, panel_h - rail_top - rail_bottom, "PANEL_ROUTE")
+
+            add_lwpolyline_rect(
+                msp,
+                x_route,
+                panel_y0 + rail_bottom,
+                route_width,
+                panel_h - rail_top - rail_bottom,
+                "PANEL_ROUTE",
+            )
 
             for row in range(rows):
                 board_y = panel_y0 + rail_bottom + row * pitch_y
+
                 tab_y_1 = board_y + board_h * 0.30
                 tab_y_2 = board_y + board_h * 0.70
-                add_lwpolyline_rect(msp, x_center - tab_width / 2.0, tab_y_1 - tab_length / 2.0, tab_width, tab_length, "PANEL_TAB")
-                add_lwpolyline_rect(msp, x_center - tab_width / 2.0, tab_y_2 - tab_length / 2.0, tab_width, tab_length, "PANEL_TAB")
 
-        # 水平板間 Router channel + Tab
+                add_lwpolyline_rect(
+                    msp,
+                    x_center - tab_width / 2.0,
+                    tab_y_1 - tab_length / 2.0,
+                    tab_width,
+                    tab_length,
+                    "PANEL_TAB",
+                )
+
+                add_lwpolyline_rect(
+                    msp,
+                    x_center - tab_width / 2.0,
+                    tab_y_2 - tab_length / 2.0,
+                    tab_width,
+                    tab_length,
+                    "PANEL_TAB",
+                )
+
+        # 水平板間 Router channel
         for row in range(1, rows):
             y_center = panel_y0 + rail_bottom + row * board_h + (row - 0.5) * gap_y
             y_route = y_center - route_width / 2.0
-            add_lwpolyline_rect(msp, panel_x0 + rail_left, y_route, panel_w - rail_left - rail_right, route_width, "PANEL_ROUTE")
+
+            add_lwpolyline_rect(
+                msp,
+                panel_x0 + rail_left,
+                y_route,
+                panel_w - rail_left - rail_right,
+                route_width,
+                "PANEL_ROUTE",
+            )
 
             for col in range(columns):
                 board_x = panel_x0 + rail_left + col * pitch_x
+
                 tab_x_1 = board_x + board_w * 0.30
                 tab_x_2 = board_x + board_w * 0.70
-                add_lwpolyline_rect(msp, tab_x_1 - tab_length / 2.0, y_center - tab_width / 2.0, tab_length, tab_width, "PANEL_TAB")
-                add_lwpolyline_rect(msp, tab_x_2 - tab_length / 2.0, y_center - tab_width / 2.0, tab_length, tab_width, "PANEL_TAB")
 
-    # 板邊與工藝邊 Tab 點。
-    if PANEL_RULES["tab"].get("edge_tab_enabled", True):
-        draw_edge_tabs(
-            msp=msp,
-            panel_x0=panel_x0,
-            panel_y0=panel_y0,
-            rail_left=rail_left,
-            rail_bottom=rail_bottom,
-            board_w=board_w,
-            board_h=board_h,
-            pitch_x=pitch_x,
-            pitch_y=pitch_y,
-            columns=columns,
-            rows=rows,
-            tab_length=tab_length,
-            tab_width=tab_width,
-            layer="PANEL_TAB",
-        )
+                add_lwpolyline_rect(
+                    msp,
+                    tab_x_1 - tab_length / 2.0,
+                    y_center - tab_width / 2.0,
+                    tab_length,
+                    tab_width,
+                    "PANEL_TAB",
+                )
+
+                add_lwpolyline_rect(
+                    msp,
+                    tab_x_2 - tab_length / 2.0,
+                    y_center - tab_width / 2.0,
+                    tab_length,
+                    tab_width,
+                    "PANEL_TAB",
+                )
 
     # Tooling Hole / Fiducial
     feature_result = auto_determine_panel_features(
