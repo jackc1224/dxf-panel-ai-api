@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.7-me-template-edge-gap-profile")
+app = FastAPI(title="PCB Panelization API", version="0.9.8-me-template-edge-tab-style")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ app.add_middleware(
 # =========================================================
 
 PANEL_RULES = {
-    "version": "company_panel_rules_v1.7_me_template_edge_gap_profile",
+    "version": "company_panel_rules_v1.8_me_template_edge_tab_style",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -101,7 +101,7 @@ PANEL_RULES = {
         "edge_to_board_gap_min_mm": 2.0,
         "edge_tab_enabled": True,
         "edge_tab_count_per_board_edge": 2,
-        "edge_tab_note": "板與板之間及 PCB edge side 與工藝邊交界處皆規劃 Router / Tab 連接點；外側板邊採白色 U 型 ROUTE 凹槽輪廓線，PCB 本體邊線於 Tab 開口處斷開，板邊與 PCB 主體四邊間距至少 2 mm，ROUTE 各連板間距至少 2 mm，需由 ME/CAM 確認分板應力。",
+        "edge_tab_note": "板與板之間及 PCB edge side 與工藝邊交界處皆規劃 Router / Tab 連接點；外側板邊採模板式白色 U 型 ROUTE 凹槽輪廓線，僅於上/下工藝邊依每片 PCB 中央形成向工藝邊內延伸的凹槽連接點，PCB 本體白色板邊線於 Tab 開口處斷開；左右兩側維持工藝邊與 Tooling Hole，不產生連續外凸 tab。板邊與 PCB 主體四邊間距至少 2 mm，ROUTE 各連板間距至少 2 mm，需由 ME/CAM 確認分板應力。",
     },
 
     "dimension": {
@@ -727,10 +727,10 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.7-me-template-edge-gap-profile",
+        "version": "0.9.8-me-template-edge-tab-style",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
-        "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white edge notch tabs, rail policy, leader dimensions, fiducial and tooling hole callouts.",
+        "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with corrected top/bottom U-notch edge tabs, rail policy, leader dimensions, fiducial and tooling hole callouts.",
     }
 
 
@@ -1442,18 +1442,19 @@ def draw_board_outline_with_edge_notches(
     """
     繪製 PCB 本體白色板邊規劃線。
 
-    與舊版不同：
-    - 不再用完整矩形框直接包住 PCB。
-    - 在最外側 PCB edge side 的 Tab 位置留白缺口。
-    - U 型 ROUTE 凹槽會從這些缺口向外延伸到工藝邊內部。
-
-    黃色原始 DXF 仍代表 PCB 本體；白色線代表 ME/CAM 規劃線。
+    v0.9.8 修正重點：
+    - 不再於左右外側產生 tab 開口，避免出現第一張圖那種四周連續小方塊。
+    - 只在最下排 PCB 的下邊與最上排 PCB 的上邊，依每片 PCB 中央留出 U 型 ROUTE 凹槽開口。
+    - PCB 本體黃色線條仍由原始 DXF 保留；白色線條只是 ME/CAM 板邊與連接點規劃線。
+    - 開口寬度依 tab_length / ROUTE 最小間距計算，確保 ROUTE 各連板間距至少 2 mm。
     """
-    ratios = [0.30, 0.70]
-    bottom_gaps = [board_x + board_w * r for r in ratios] if row == 0 else []
-    top_gaps = [board_x + board_w * r for r in ratios] if row == rows - 1 else []
-    left_gaps = [board_y + board_h * r for r in ratios] if col == 0 else []
-    right_gaps = [board_y + board_h * r for r in ratios] if col == columns - 1 else []
+    center_ratio = 0.50
+    bottom_gaps = [board_x + board_w * center_ratio] if row == 0 else []
+    top_gaps = [board_x + board_w * center_ratio] if row == rows - 1 else []
+
+    # 左右側只畫完整白色板邊線，不留 U 型 tab 缺口。
+    left_gaps: List[float] = []
+    right_gaps: List[float] = []
 
     _draw_segmented_horizontal_line(msp, board_x, board_x + board_w, board_y, bottom_gaps, notch_width, layer)
     _draw_segmented_horizontal_line(msp, board_x, board_x + board_w, board_y + board_h, top_gaps, notch_width, layer)
@@ -1483,35 +1484,38 @@ def draw_outer_edge_tabs(
     """
     PCB edge side 專用 Router / Tab 白色凹槽輪廓。
 
-    依使用者提供的模板圖修正：
-    1. 黃色原始 DXF = PCB 本體，不在此函式修改。
-    2. 白色底部 / 外側工藝邊 = 獨立 rail 條，由 panel 外框與 rail 邊界線形成。
-    3. 白色 U 型 Tab = 從 PCB 本體邊緣「向外穿入工藝邊內部」的 ROUTE 凹槽。
-    4. U 型開口朝 PCB 本體，PCB 白色板邊規劃線會在 Tab 開口處斷開。
-    5. 不畫外部突出方塊，不再畫多餘的內部橫線，只畫 U 型凹槽兩側與底部線。
+    v0.9.8 修正成使用者第二張圖的呈現方式：
+    1. 下方 / 上方工藝邊是獨立完整的白色 rail 條。
+    2. U 型 Tab 不是外部突出方塊，而是從 PCB 本體邊緣向外穿過 edge gap，進入工藝邊內部。
+    3. 每片外側 PCB 的上/下邊中央配置 1 個 U 型 ROUTE 凹槽，樣式接近第二張圖。
+    4. 左右兩側不再畫外側 U 型 tab，避免產生第一張圖那種四周連續小方塊。
+    5. PCB 本體白色板邊線會在 U 型開口處斷開，形成「線上有缺口」的 ME/CAM 規劃效果。
     6. ROUTE 各切點 / 連板間距至少 2 mm。
     """
-    ratios = [0.30, 0.70]
+    center_ratio = 0.50
 
-    min_gap = max(PANEL_RULES["cutting"]["router_min_gap_mm"], 2.0)
-    notch_w = max(tab_width, min_gap)
-    notch_l = max(tab_length, 7.0)
+    min_gap = max(PANEL_RULES["cutting"]["router_min_gap_mm"], PANEL_RULES["tab"]["route_gap_mm"], 2.0)
 
-    # U 型從 PCB 本體邊緣向外穿過 edge gap，進入工藝邊內部；
-    # edge gap 四邊皆需至少 2 mm。深度包含 edge gap + 部分 rail，但不得穿出 panel 外框。
-    edge_gap_bottom = max(edge_gap_bottom, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"])
-    edge_gap_top = max(edge_gap_top, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"])
-    edge_gap_left = max(edge_gap_left, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"])
-    edge_gap_right = max(edge_gap_right, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"])
-    vertical_depth_bottom = edge_gap_bottom + max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
-    vertical_depth_top = edge_gap_top + max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
-    horizontal_depth_left = edge_gap_left + max(2.0, min(max(rail_left - 1.0, 2.0), 8.0))
-    horizontal_depth_right = edge_gap_right + max(2.0, min(max(rail_left - 1.0, 2.0), 8.0))
+    # notch_width 是沿 PCB 邊線方向的開口寬度；不得小於 ROUTE 最小間距。
+    notch_width = max(tab_length, 7.0, min_gap)
 
-    def draw_bottom_notch(cx: float, pcb_edge_y: float):
+    # notch_depth 是從 PCB 邊緣向工藝邊內部延伸的深度。
+    # 需穿過 edge gap 並進入 rail，但不可超出 panel 外框。
+    edge_gap_bottom = max(edge_gap_bottom, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"], min_gap)
+    edge_gap_top = max(edge_gap_top, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"], min_gap)
+
+    rail_penetration_bottom = max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
+    rail_penetration_top = max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
+
+    vertical_depth_bottom = edge_gap_bottom + rail_penetration_bottom
+    vertical_depth_top = edge_gap_top + rail_penetration_top
+
+    def draw_bottom_u_notch(cx: float, pcb_edge_y: float):
         """底部 PCB edge：U 型從 PCB 下邊緣向下進入底部工藝邊。"""
-        half = notch_l / 2.0
+        half = notch_width / 2.0
         y_out = pcb_edge_y - vertical_depth_bottom
+
+        # 開放 U 型線：兩側線 + 底線；開口朝 PCB 本體。
         add_lwpolyline_open(
             msp,
             [
@@ -1523,10 +1527,14 @@ def draw_outer_edge_tabs(
             layer,
         )
 
-    def draw_top_notch(cx: float, pcb_edge_y: float):
+        # 於凹槽底部加中心小線，讓 CAM 檢查切點位置時更清楚。
+        add_line(msp, cx, y_out, cx, y_out + min_gap, layer)
+
+    def draw_top_u_notch(cx: float, pcb_edge_y: float):
         """上方 PCB edge：U 型從 PCB 上邊緣向上進入上方工藝邊。"""
-        half = notch_l / 2.0
+        half = notch_width / 2.0
         y_out = pcb_edge_y + vertical_depth_top
+
         add_lwpolyline_open(
             msp,
             [
@@ -1538,63 +1546,19 @@ def draw_outer_edge_tabs(
             layer,
         )
 
-    def draw_left_notch(pcb_edge_x: float, cy: float):
-        """左側 PCB edge：U 型從 PCB 左邊緣向左進入左工藝邊。"""
-        half = notch_l / 2.0
-        x_out = pcb_edge_x - horizontal_depth_left
-        add_lwpolyline_open(
-            msp,
-            [
-                (pcb_edge_x, cy - half),
-                (x_out, cy - half),
-                (x_out, cy + half),
-                (pcb_edge_x, cy + half),
-            ],
-            layer,
-        )
-
-    def draw_right_notch(pcb_edge_x: float, cy: float):
-        """右側 PCB edge：U 型從 PCB 右邊緣向右進入右工藝邊。"""
-        half = notch_l / 2.0
-        x_out = pcb_edge_x + horizontal_depth_right
-        add_lwpolyline_open(
-            msp,
-            [
-                (pcb_edge_x, cy - half),
-                (x_out, cy - half),
-                (x_out, cy + half),
-                (pcb_edge_x, cy + half),
-            ],
-            layer,
-        )
+        add_line(msp, cx, y_out, cx, y_out - min_gap, layer)
 
     # 下外側：第一列 PCB 下邊與底部工藝邊交界處。
     bottom_edge_y = panel_y0 + rail_bottom + edge_gap_bottom
     for col in range(columns):
         bx = panel_x0 + rail_left + edge_gap_left + col * pitch_x
-        for ratio in ratios:
-            draw_bottom_notch(bx + board_w * ratio, bottom_edge_y)
+        draw_bottom_u_notch(bx + board_w * center_ratio, bottom_edge_y)
 
     # 上外側：最後一列 PCB 上邊與上方工藝邊交界處。
     top_edge_y = panel_y0 + rail_bottom + edge_gap_bottom + (rows - 1) * pitch_y + board_h
     for col in range(columns):
         bx = panel_x0 + rail_left + edge_gap_left + col * pitch_x
-        for ratio in ratios:
-            draw_top_notch(bx + board_w * ratio, top_edge_y)
-
-    # 左外側：第一欄 PCB 左邊與左工藝邊交界處。
-    left_edge_x = panel_x0 + rail_left + edge_gap_left
-    for row in range(rows):
-        by = panel_y0 + rail_bottom + edge_gap_bottom + row * pitch_y
-        for ratio in ratios:
-            draw_left_notch(left_edge_x, by + board_h * ratio)
-
-    # 右外側：最後一欄 PCB 右邊與右工藝邊交界處。
-    right_edge_x = panel_x0 + rail_left + edge_gap_left + (columns - 1) * pitch_x + board_w
-    for row in range(rows):
-        by = panel_y0 + rail_bottom + edge_gap_bottom + row * pitch_y
-        for ratio in ratios:
-            draw_right_notch(right_edge_x, by + board_h * ratio)
+        draw_top_u_notch(bx + board_w * center_ratio, top_edge_y)
 
 
 # =========================================================
