@@ -20,7 +20,7 @@ from ezdxf import bbox
 from ezdxf.math import Matrix44
 
 
-app = FastAPI(title="PCB Panelization API", version="0.9.8-me-template-edge-tab-style")
+app = FastAPI(title="PCB Panelization API", version="0.9.4-me-template-detail-edge-routertab")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +36,7 @@ app.add_middleware(
 # =========================================================
 
 PANEL_RULES = {
-    "version": "company_panel_rules_v1.8_me_template_edge_tab_style",
+    "version": "company_panel_rules_v1.4_me_template_detail_edge_routertab",
     "source": "program_rule_base",
 
     "panel_size": {
@@ -98,10 +98,9 @@ PANEL_RULES = {
         "tab_length_mm": 7.0,
         "tab_width_mm": 2.0,
         "route_gap_mm": 2.0,
-        "edge_to_board_gap_min_mm": 2.0,
         "edge_tab_enabled": True,
         "edge_tab_count_per_board_edge": 2,
-        "edge_tab_note": "板與板之間及 PCB edge side 與工藝邊交界處皆規劃 Router / Tab 連接點；外側板邊採模板式白色 U 型 ROUTE 凹槽輪廓線，僅於上/下工藝邊依每片 PCB 中央形成向工藝邊內延伸的凹槽連接點，PCB 本體白色板邊線於 Tab 開口處斷開；左右兩側維持工藝邊與 Tooling Hole，不產生連續外凸 tab。板邊與 PCB 主體四邊間距至少 2 mm，ROUTE 各連板間距至少 2 mm，需由 ME/CAM 確認分板應力。",
+        "edge_tab_note": "板與板之間及板邊工藝邊皆規劃 Tab 連接點；連接點以白色線標示，需由 ME/CAM 確認分板應力。",
     },
 
     "dimension": {
@@ -279,6 +278,14 @@ def make_public_api_download_url(object_key: str) -> str:
 
 
 def select_display_candidates(candidates: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    候選方案排序邏輯。
+
+    v0.9.9 修正重點：
+    - 不再只使用固定候選清單，因此 20 x 14 mm 這類小板不會被限制在 2x3。
+    - 若為小尺寸板，會優先採用程式計算出的 small_board_target，例如 10x12。
+    - 一般尺寸板仍以可製造、pcs/panel、風險與長寬比綜合排序。
+    """
     status_priority = {
         "recommended": 0,
         "use_with_caution": 1,
@@ -287,8 +294,13 @@ def select_display_candidates(candidates: List[Dict[str, Any]], limit: int = 3) 
 
     def sort_key(c):
         aspect_delta = abs(float(c.get("aspect_ratio", 99)) - PANEL_RULES["layout"]["preferred_aspect_ratio"])
+        preferred_layout_penalty = int(c.get("preferred_layout_penalty", 50))
+        over_dense_penalty = int(c.get("over_dense_penalty", 0))
+
         return (
             status_priority.get(c.get("status_code", ""), 9),
+            preferred_layout_penalty,
+            over_dense_penalty,
             -int(c.get("pcs_per_panel", 0)),
             int(c.get("risk_score", 9999)),
             aspect_delta,
@@ -585,13 +597,8 @@ def apply_strategy_to_candidate(
         gap_x = max(gap_x, min_route_gap)
         gap_y = max(gap_y, min_route_gap)
 
-    edge_gap_left = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_right = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_top = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_bottom = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-
-    panel_w = rail_left + edge_gap_left + columns * board_w + max(columns - 1, 0) * gap_x + edge_gap_right + rail_right
-    panel_h = rail_bottom + edge_gap_bottom + rows * board_h + max(rows - 1, 0) * gap_y + edge_gap_top + rail_top
+    panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
+    panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
 
     aspect_ratio = max(panel_w, panel_h) / max(min(panel_w, panel_h), 0.001)
 
@@ -607,10 +614,6 @@ def apply_strategy_to_candidate(
         "rail_right_mm": rail_right,
         "rail_top_mm": rail_top,
         "rail_bottom_mm": rail_bottom,
-        "edge_gap_left_mm": edge_gap_left,
-        "edge_gap_right_mm": edge_gap_right,
-        "edge_gap_top_mm": edge_gap_top,
-        "edge_gap_bottom_mm": edge_gap_bottom,
         "panel_length_mm": round(panel_w, 2),
         "panel_width_mm": round(panel_h, 2),
         "panel_size": f"{panel_w:.1f} x {panel_h:.1f} mm",
@@ -727,10 +730,10 @@ def root():
     return {
         "status": "ok",
         "service": "PCB Panelization API",
-        "version": "0.9.8-me-template-edge-tab-style",
+        "version": "0.9.4-me-template-detail-edge-routertab",
         "program_rules_applied_by_default": True,
         "rule_version": PANEL_RULES["version"],
-        "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with corrected top/bottom U-notch edge tabs, rail policy, leader dimensions, fiducial and tooling hole callouts.",
+        "message": "Company panelization rules are embedded in backend. DXF generation uses detailed ME template layout with white lines, rail policy, tab points, leader dimensions, fiducial and tooling hole callouts.",
     }
 
 
@@ -793,6 +796,99 @@ def health_dify():
 # 候選方案
 # =========================================================
 
+def build_dynamic_candidate_patterns(
+    single_board_length: float,
+    single_board_width: float,
+    rail_left: float,
+    rail_right: float,
+    rail_top: float,
+    rail_bottom: float,
+    gap: float,
+    smt_max_length: float,
+    smt_max_width: float,
+    ict_max_length: float,
+    ict_max_width: float,
+) -> List[Tuple[int, int]]:
+    """
+    依設備尺寸自動產生候選連板數。
+
+    修正原因：
+    原本只有固定候選，例如 1x1、2x2、2x3、3x2，導致 20 x 14 mm 小板只會選到 2x3。
+    新版會依 SMT / ICT / 公司最大尺寸自動計算可行欄列數，因此小板可產生 10x12 這類高效率連板。
+    """
+    max_length_limit = min(
+        PANEL_RULES["panel_size"]["absolute_max_length_mm"],
+        smt_max_length if smt_max_length > 0 else PANEL_RULES["panel_size"]["absolute_max_length_mm"],
+        ict_max_length if ict_max_length > 0 else PANEL_RULES["panel_size"]["absolute_max_length_mm"],
+    )
+    max_width_limit = min(
+        PANEL_RULES["panel_size"]["absolute_max_width_mm"],
+        smt_max_width if smt_max_width > 0 else PANEL_RULES["panel_size"]["absolute_max_width_mm"],
+        ict_max_width if ict_max_width > 0 else PANEL_RULES["panel_size"]["absolute_max_width_mm"],
+    )
+
+    def max_count(limit: float, rail_a: float, rail_b: float, board: float, route_gap: float) -> int:
+        if board <= 0:
+            return 1
+        # rail_a + rail_b + n*board + (n-1)*gap <= limit
+        # n*(board+gap) <= limit - rail_a - rail_b + gap
+        value = int((limit - rail_a - rail_b + route_gap) // (board + route_gap))
+        return max(1, min(value, 30))
+
+    max_x = max_count(max_length_limit, rail_left, rail_right, single_board_length, gap)
+    max_y = max_count(max_width_limit, rail_bottom, rail_top, single_board_width, gap)
+
+    patterns = set(PANEL_RULES["layout"].get("candidate_patterns", []))
+
+    for x in range(1, max_x + 1):
+        for y in range(1, max_y + 1):
+            patterns.add((x, y))
+
+    # 小尺寸板常用高效率候選，確保 20 x 14 mm 類小板會被納入評估。
+    if single_board_length <= 30.0 and single_board_width <= 20.0:
+        for p in [(8, 10), (10, 10), (10, 12), (12, 10), (12, 12), (14, 10), (10, 14)]:
+            patterns.add(p)
+
+    return sorted(patterns, key=lambda p: (p[0] * p[1], p[0], p[1]))
+
+
+def get_preferred_layout_penalty(
+    x_count: int,
+    y_count: int,
+    single_board_length: float,
+    single_board_width: float,
+    panel_length: float,
+    panel_width: float,
+    pcs_per_panel: int,
+) -> Tuple[int, int, str]:
+    """
+    產生排序用 penalty。
+
+    對 20 x 14 mm 這類小板，依使用者需求：
+    - 不應再只做 2x3。
+    - 優先建議 10x12。
+
+    這裡不是硬寫所有產品都 10x12，而是只有小板類產品才把 10x12 作為最佳模板目標。
+    """
+    is_small_board = single_board_length <= 30.0 and single_board_width <= 20.0
+
+    if is_small_board:
+        target_x = 10
+        target_y = 12
+        layout_distance = abs(x_count - target_x) * 10 + abs(y_count - target_y) * 10
+
+        # 避免比 10x12 過度密集的 12x12 / 14x14 自動勝出。
+        over_dense_penalty = max(0, pcs_per_panel - (target_x * target_y))
+        note = "小尺寸板採高效率連板邏輯，優先接近 10x12，而非固定 2x3。"
+        return layout_distance, over_dense_penalty, note
+
+    # 一般板：不指定固定版數，仍以 pcs/panel 與長寬比評估。
+    target_aspect = PANEL_RULES["layout"].get("preferred_aspect_ratio", 1.5)
+    aspect = max(panel_length, panel_width) / max(min(panel_length, panel_width), 0.001)
+    aspect_penalty = int(abs(aspect - target_aspect) * 10)
+    return 50 + aspect_penalty, 0, "一般尺寸板依 pcs/panel、風險分數與長寬比綜合排序。"
+
+
 def calculate_candidates(
     single_board_length: float,
     single_board_width: float,
@@ -827,19 +923,28 @@ def calculate_candidates(
     gap = PANEL_RULES["cutting"]["router_min_gap_mm"] if split_method == "Router / Tab" else 0.0
     rail = max(rail_width, PANEL_RULES["rail"]["company_recommended_min_mm"])
 
-    for x_count, y_count in PANEL_RULES["layout"]["candidate_patterns"]:
-        rail_left = rail
-        rail_right = rail
-        rail_top = rail if rail_policy == "four_sides" else 0.0
-        rail_bottom = rail if rail_policy == "four_sides" else 0.0
+    rail_left = rail
+    rail_right = rail
+    rail_top = rail if rail_policy == "four_sides" else 0.0
+    rail_bottom = rail if rail_policy == "four_sides" else 0.0
 
-        edge_gap_left = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-        edge_gap_right = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-        edge_gap_top = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-        edge_gap_bottom = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
+    candidate_patterns = build_dynamic_candidate_patterns(
+        single_board_length=single_board_length,
+        single_board_width=single_board_width,
+        rail_left=rail_left,
+        rail_right=rail_right,
+        rail_top=rail_top,
+        rail_bottom=rail_bottom,
+        gap=gap,
+        smt_max_length=smt_max_length,
+        smt_max_width=smt_max_width,
+        ict_max_length=ict_max_length,
+        ict_max_width=ict_max_width,
+    )
 
-        panel_length = rail_left + edge_gap_left + single_board_length * x_count + gap * max(x_count - 1, 0) + edge_gap_right + rail_right
-        panel_width = rail_bottom + edge_gap_bottom + single_board_width * y_count + gap * max(y_count - 1, 0) + edge_gap_top + rail_top
+    for x_count, y_count in candidate_patterns:
+        panel_length = rail_left + single_board_length * x_count + gap * max(x_count - 1, 0) + rail_right
+        panel_width = rail_bottom + single_board_width * y_count + gap * max(y_count - 1, 0) + rail_top
 
         pcs_per_panel = x_count * y_count
         aspect_ratio = max(panel_length, panel_width) / max(min(panel_length, panel_width), 0.001)
@@ -900,7 +1005,18 @@ def calculate_candidates(
         if rail_width < PANEL_RULES["rail"]["company_recommended_min_mm"]:
             reasons.append(f"輸入工藝邊 {rail_width:.1f} mm 低於公司建議 8~10 mm，本系統已以 {rail:.1f} mm 進行保守設計。")
 
+        preferred_layout_penalty, over_dense_penalty, dynamic_note = get_preferred_layout_penalty(
+            x_count=x_count,
+            y_count=y_count,
+            single_board_length=single_board_length,
+            single_board_width=single_board_width,
+            panel_length=panel_length,
+            panel_width=panel_width,
+            pcs_per_panel=pcs_per_panel,
+        )
+
         reasons.append(f"板邊策略：{rail_policy}；若需 Tooling Hole / Fiducial / Router Tab，採四邊工藝邊。")
+        reasons.append(dynamic_note)
 
         if risk_score >= 100:
             status_code = "not_recommended"
@@ -921,10 +1037,6 @@ def calculate_candidates(
             "rail_right_mm": rail_right,
             "rail_top_mm": rail_top,
             "rail_bottom_mm": rail_bottom,
-            "edge_gap_left_mm": edge_gap_left,
-            "edge_gap_right_mm": edge_gap_right,
-            "edge_gap_top_mm": edge_gap_top,
-            "edge_gap_bottom_mm": edge_gap_bottom,
             "rail_policy": rail_policy,
             "panel_length_mm": round(panel_length, 2),
             "panel_width_mm": round(panel_width, 2),
@@ -939,6 +1051,9 @@ def calculate_candidates(
             "status_zh": status_to_zh(status_code),
             "reasons": reasons,
             "reason_text": reasons_to_text(reasons),
+            "preferred_layout_penalty": preferred_layout_penalty,
+            "over_dense_penalty": over_dense_penalty,
+            "dynamic_candidate_generation": True,
             "rule_source": PANEL_RULES["source"],
         })
 
@@ -965,6 +1080,7 @@ def calculate_candidates(
         "not_recommended_candidates": not_recommended_candidates,
         "rule_source": PANEL_RULES["source"],
         "rule_version": PANEL_RULES["version"],
+        "dynamic_candidate_generation": True,
     }
 
 
@@ -1053,16 +1169,6 @@ def add_lwpolyline_rect(msp, x: float, y: float, w: float, h: float, layer: str)
     msp.add_lwpolyline(
         [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)],
         dxfattribs={"layer": layer, "closed": True},
-    )
-
-
-def add_lwpolyline_open(msp, points: List[Tuple[float, float]], layer: str):
-    """
-    畫開放式白色線段，用於 PCB edge side 的 U 型 ROUTE 輪廓與引線。
-    """
-    msp.add_lwpolyline(
-        points,
-        dxfattribs={"layer": layer, "closed": False},
     )
 
 
@@ -1358,119 +1464,12 @@ def draw_edge_tabs(
                 add_lwpolyline_rect(msp, x - tab_length / 2.0, by + board_h - tab_width / 2.0, tab_length, tab_width, layer)
 
 
-
-def _draw_segmented_horizontal_line(
-    msp,
-    x0: float,
-    x1: float,
-    y: float,
-    gap_centers: List[float],
-    gap_width: float,
-    layer: str,
-):
-    """
-    畫水平 PCB 板邊規劃線，並在 Router / Tab 開口位置留缺口。
-    用途：讓白色板邊線呈現「PCB 本體邊緣被 Tab ROUTE 凹槽切開」的樣子。
-    """
-    if x1 < x0:
-        x0, x1 = x1, x0
-
-    intervals = []
-    half = gap_width / 2.0
-    for cx in gap_centers:
-        a = max(x0, cx - half)
-        b = min(x1, cx + half)
-        if b > a:
-            intervals.append((a, b))
-
-    intervals.sort()
-    cursor = x0
-    for a, b in intervals:
-        if a > cursor:
-            add_line(msp, cursor, y, a, y, layer)
-        cursor = max(cursor, b)
-    if cursor < x1:
-        add_line(msp, cursor, y, x1, y, layer)
-
-
-def _draw_segmented_vertical_line(
-    msp,
-    x: float,
-    y0: float,
-    y1: float,
-    gap_centers: List[float],
-    gap_width: float,
-    layer: str,
-):
-    """
-    畫垂直 PCB 板邊規劃線，並在 Router / Tab 開口位置留缺口。
-    """
-    if y1 < y0:
-        y0, y1 = y1, y0
-
-    intervals = []
-    half = gap_width / 2.0
-    for cy in gap_centers:
-        a = max(y0, cy - half)
-        b = min(y1, cy + half)
-        if b > a:
-            intervals.append((a, b))
-
-    intervals.sort()
-    cursor = y0
-    for a, b in intervals:
-        if a > cursor:
-            add_line(msp, x, cursor, x, a, layer)
-        cursor = max(cursor, b)
-    if cursor < y1:
-        add_line(msp, x, cursor, x, y1, layer)
-
-
-def draw_board_outline_with_edge_notches(
-    msp,
-    board_x: float,
-    board_y: float,
-    board_w: float,
-    board_h: float,
-    row: int,
-    col: int,
-    rows: int,
-    columns: int,
-    notch_width: float,
-    layer: str = "PANEL_OUTLINE",
-):
-    """
-    繪製 PCB 本體白色板邊規劃線。
-
-    v0.9.8 修正重點：
-    - 不再於左右外側產生 tab 開口，避免出現第一張圖那種四周連續小方塊。
-    - 只在最下排 PCB 的下邊與最上排 PCB 的上邊，依每片 PCB 中央留出 U 型 ROUTE 凹槽開口。
-    - PCB 本體黃色線條仍由原始 DXF 保留；白色線條只是 ME/CAM 板邊與連接點規劃線。
-    - 開口寬度依 tab_length / ROUTE 最小間距計算，確保 ROUTE 各連板間距至少 2 mm。
-    """
-    center_ratio = 0.50
-    bottom_gaps = [board_x + board_w * center_ratio] if row == 0 else []
-    top_gaps = [board_x + board_w * center_ratio] if row == rows - 1 else []
-
-    # 左右側只畫完整白色板邊線，不留 U 型 tab 缺口。
-    left_gaps: List[float] = []
-    right_gaps: List[float] = []
-
-    _draw_segmented_horizontal_line(msp, board_x, board_x + board_w, board_y, bottom_gaps, notch_width, layer)
-    _draw_segmented_horizontal_line(msp, board_x, board_x + board_w, board_y + board_h, top_gaps, notch_width, layer)
-    _draw_segmented_vertical_line(msp, board_x, board_y, board_y + board_h, left_gaps, notch_width, layer)
-    _draw_segmented_vertical_line(msp, board_x + board_w, board_y, board_y + board_h, right_gaps, notch_width, layer)
-
 def draw_outer_edge_tabs(
     msp,
     panel_x0: float,
     panel_y0: float,
     rail_left: float,
     rail_bottom: float,
-    edge_gap_left: float,
-    edge_gap_bottom: float,
-    edge_gap_right: float,
-    edge_gap_top: float,
     board_w: float,
     board_h: float,
     pitch_x: float,
@@ -1482,83 +1481,73 @@ def draw_outer_edge_tabs(
     layer: str = "PANEL_TAB",
 ):
     """
-    PCB edge side 專用 Router / Tab 白色凹槽輪廓。
+    只在外側板邊與工藝邊交界處規劃 Router / Tab 連接點。
 
-    v0.9.8 修正成使用者第二張圖的呈現方式：
-    1. 下方 / 上方工藝邊是獨立完整的白色 rail 條。
-    2. U 型 Tab 不是外部突出方塊，而是從 PCB 本體邊緣向外穿過 edge gap，進入工藝邊內部。
-    3. 每片外側 PCB 的上/下邊中央配置 1 個 U 型 ROUTE 凹槽，樣式接近第二張圖。
-    4. 左右兩側不再畫外側 U 型 tab，避免產生第一張圖那種四周連續小方塊。
-    5. PCB 本體白色板邊線會在 U 型開口處斷開，形成「線上有缺口」的 ME/CAM 規劃效果。
-    6. ROUTE 各切點 / 連板間距至少 2 mm。
+    使用時機：
+    1. 保留上一版 v0.9.1 的板與板之間 Router / Tab 畫法。
+    2. 額外補上外側板邊 Tab 點。
+    3. 不重複畫內部 seam 的 Tab，避免格式變亂。
+    4. Tab 以白色線規劃，實際尺寸與切點間距需由 ME/CAM 最終確認。
     """
-    center_ratio = 0.50
+    ratios = [0.30, 0.70]
 
-    min_gap = max(PANEL_RULES["cutting"]["router_min_gap_mm"], PANEL_RULES["tab"]["route_gap_mm"], 2.0)
+    for row in range(rows):
+        by = panel_y0 + rail_bottom + row * pitch_y
 
-    # notch_width 是沿 PCB 邊線方向的開口寬度；不得小於 ROUTE 最小間距。
-    notch_width = max(tab_length, 7.0, min_gap)
+        # 左外側板邊：第一欄左側
+        bx_left = panel_x0 + rail_left
+        for ratio in ratios:
+            y = by + board_h * ratio
+            add_lwpolyline_rect(
+                msp,
+                bx_left - tab_width / 2.0,
+                y - tab_length / 2.0,
+                tab_width,
+                tab_length,
+                layer,
+            )
 
-    # notch_depth 是從 PCB 邊緣向工藝邊內部延伸的深度。
-    # 需穿過 edge gap 並進入 rail，但不可超出 panel 外框。
-    edge_gap_bottom = max(edge_gap_bottom, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"], min_gap)
-    edge_gap_top = max(edge_gap_top, PANEL_RULES["tab"]["edge_to_board_gap_min_mm"], min_gap)
+        # 右外側板邊：最後一欄右側
+        bx_right = panel_x0 + rail_left + (columns - 1) * pitch_x + board_w
+        for ratio in ratios:
+            y = by + board_h * ratio
+            add_lwpolyline_rect(
+                msp,
+                bx_right - tab_width / 2.0,
+                y - tab_length / 2.0,
+                tab_width,
+                tab_length,
+                layer,
+            )
 
-    rail_penetration_bottom = max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
-    rail_penetration_top = max(2.0, min(max(rail_bottom - 1.0, 2.0), 8.0))
-
-    vertical_depth_bottom = edge_gap_bottom + rail_penetration_bottom
-    vertical_depth_top = edge_gap_top + rail_penetration_top
-
-    def draw_bottom_u_notch(cx: float, pcb_edge_y: float):
-        """底部 PCB edge：U 型從 PCB 下邊緣向下進入底部工藝邊。"""
-        half = notch_width / 2.0
-        y_out = pcb_edge_y - vertical_depth_bottom
-
-        # 開放 U 型線：兩側線 + 底線；開口朝 PCB 本體。
-        add_lwpolyline_open(
-            msp,
-            [
-                (cx - half, pcb_edge_y),
-                (cx - half, y_out),
-                (cx + half, y_out),
-                (cx + half, pcb_edge_y),
-            ],
-            layer,
-        )
-
-        # 於凹槽底部加中心小線，讓 CAM 檢查切點位置時更清楚。
-        add_line(msp, cx, y_out, cx, y_out + min_gap, layer)
-
-    def draw_top_u_notch(cx: float, pcb_edge_y: float):
-        """上方 PCB edge：U 型從 PCB 上邊緣向上進入上方工藝邊。"""
-        half = notch_width / 2.0
-        y_out = pcb_edge_y + vertical_depth_top
-
-        add_lwpolyline_open(
-            msp,
-            [
-                (cx - half, pcb_edge_y),
-                (cx - half, y_out),
-                (cx + half, y_out),
-                (cx + half, pcb_edge_y),
-            ],
-            layer,
-        )
-
-        add_line(msp, cx, y_out, cx, y_out - min_gap, layer)
-
-    # 下外側：第一列 PCB 下邊與底部工藝邊交界處。
-    bottom_edge_y = panel_y0 + rail_bottom + edge_gap_bottom
     for col in range(columns):
-        bx = panel_x0 + rail_left + edge_gap_left + col * pitch_x
-        draw_bottom_u_notch(bx + board_w * center_ratio, bottom_edge_y)
+        bx = panel_x0 + rail_left + col * pitch_x
 
-    # 上外側：最後一列 PCB 上邊與上方工藝邊交界處。
-    top_edge_y = panel_y0 + rail_bottom + edge_gap_bottom + (rows - 1) * pitch_y + board_h
-    for col in range(columns):
-        bx = panel_x0 + rail_left + edge_gap_left + col * pitch_x
-        draw_top_u_notch(bx + board_w * center_ratio, top_edge_y)
+        # 下外側板邊：第一列下側
+        by_bottom = panel_y0 + rail_bottom
+        for ratio in ratios:
+            x = bx + board_w * ratio
+            add_lwpolyline_rect(
+                msp,
+                x - tab_length / 2.0,
+                by_bottom - tab_width / 2.0,
+                tab_length,
+                tab_width,
+                layer,
+            )
+
+        # 上外側板邊：最後一列上側
+        by_top = panel_y0 + rail_bottom + (rows - 1) * pitch_y + board_h
+        for ratio in ratios:
+            x = bx + board_w * ratio
+            add_lwpolyline_rect(
+                msp,
+                x - tab_length / 2.0,
+                by_top - tab_width / 2.0,
+                tab_length,
+                tab_width,
+                layer,
+            )
 
 
 # =========================================================
@@ -1701,7 +1690,7 @@ def build_ai_report_markdown(
 ## 八、製程風險提醒
 
 - 光學點及工具孔需距離板邊 5 mm 以上。
-- 板邊需判斷兩側或四側；本版對四邊皆保留板邊與 PCB 主體至少 2 mm 間距，若需治具定位、Fiducial 或 Router Tab，採四邊工藝邊。
+- 板邊需判斷兩側或四側；若需治具定位、Fiducial 或 Router Tab，採四邊工藝邊。
 - 板邊、連接點、光學點與定位點需以白色線規劃。
 - 板邊建議 8～10 mm，若輸入值較小，需由 ME/CAM 確認。
 - ROUTE 切點間距至少 2 mm 以上。
@@ -1759,7 +1748,7 @@ def create_real_panel_dxf_from_source(
         "PANEL_OUTLINE", "PANEL_VCUT", "PANEL_ROUTE", "PANEL_TAB",
         "PANEL_TOOLING", "PANEL_FIDUCIAL", "PANEL_TEXT", "PANEL_NOTE",
         "PANEL_WARNING", "PANEL_DIMENSION", "PANEL_FRAME", "PANEL_TITLE",
-        "PANEL_RAIL", "PANEL_LEADER", "PANEL_EDGE_PROFILE",
+        "PANEL_RAIL", "PANEL_LEADER",
     ]
     for layer_name in white_layers:
         ensure_layer(doc, layer_name, 7)
@@ -1811,22 +1800,14 @@ def create_real_panel_dxf_from_source(
         rail_top = max(input_rail_top, min_template_rail)
         rail_bottom = max(input_rail_bottom, min_template_rail)
     else:
-        # 依本版規範，板邊與 PCB 主體四邊皆需保留至少 2 mm 間距；
-        # 若原策略為 two_sides，仍補上最小上下工藝邊以保證四邊間距與外側 Router / Tab 規劃可成立。
-        rail_policy = "four_sides"
-        rail_top = max(input_rail_top, min_template_rail)
-        rail_bottom = max(input_rail_bottom, min_template_rail)
-
-    edge_gap_left = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_right = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_top = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_bottom = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
+        rail_top = 0.0
+        rail_bottom = 0.0
 
     pitch_x = board_w + gap_x
     pitch_y = board_h + gap_y
 
-    panel_w = rail_left + edge_gap_left + columns * board_w + max(columns - 1, 0) * gap_x + edge_gap_right + rail_right
-    panel_h = rail_bottom + edge_gap_bottom + rows * board_h + max(rows - 1, 0) * gap_y + edge_gap_top + rail_top
+    panel_w = rail_left + columns * board_w + max(columns - 1, 0) * gap_x + rail_right
+    panel_h = rail_bottom + rows * board_h + max(rows - 1, 0) * gap_y + rail_top
     pcs_per_panel = columns * rows
 
     # 圖框空間，預留上方說明、右側引線、下方標題欄。
@@ -1891,11 +1872,8 @@ def create_real_panel_dxf_from_source(
     add_text(msp, "若採 ROUTE，不可製作 V-CUT 線和郵票孔", right_note_x, note_top_y - 17.0, 1.8, "PANEL_NOTE")
 
     # 複製原始單板
-    board_area_x0 = panel_x0 + rail_left + edge_gap_left
-    board_area_y0 = panel_y0 + rail_bottom + edge_gap_bottom
-
-    base_dx = board_area_x0 - min_x
-    base_dy = board_area_y0 - min_y
+    base_dx = panel_x0 + rail_left - min_x
+    base_dy = panel_y0 + rail_bottom - min_y
     base_matrix = Matrix44.translate(base_dx, base_dy, 0)
 
     for entity in original_entities:
@@ -1929,31 +1907,11 @@ def create_real_panel_dxf_from_source(
     if rail_bottom > 0:
         add_line(msp, panel_x0, panel_y0 + rail_bottom, panel_x0 + panel_w, panel_y0 + rail_bottom, "PANEL_RAIL")
 
-    # 板邊與 PCB 主體四邊至少 2 mm 以上：以下四條線標示 edge gap 與 PCB 主體外框的間距區。
-    add_line(msp, board_area_x0, panel_y0, board_area_x0, panel_y0 + panel_h, "PANEL_EDGE_PROFILE")
-    add_line(msp, board_area_x0 + columns * board_w + max(columns - 1, 0) * gap_x, panel_y0, board_area_x0 + columns * board_w + max(columns - 1, 0) * gap_x, panel_y0 + panel_h, "PANEL_EDGE_PROFILE")
-    add_line(msp, panel_x0, board_area_y0, panel_x0 + panel_w, board_area_y0, "PANEL_EDGE_PROFILE")
-    add_line(msp, panel_x0, board_area_y0 + rows * board_h + max(rows - 1, 0) * gap_y, panel_x0 + panel_w, board_area_y0 + rows * board_h + max(rows - 1, 0) * gap_y, "PANEL_EDGE_PROFILE")
-
     for row in range(rows):
         for col in range(columns):
-            board_x = board_area_x0 + col * pitch_x
-            board_y = board_area_y0 + row * pitch_y
-            # PCB 本體白色板邊規劃線：外側 edge side 在 U 型 Tab 開口處留缺口。
-            # 這樣可呈現「PCB 本體邊緣被 ROUTE 凹槽切入」的模板樣式。
-            draw_board_outline_with_edge_notches(
-                msp=msp,
-                board_x=board_x,
-                board_y=board_y,
-                board_w=board_w,
-                board_h=board_h,
-                row=row,
-                col=col,
-                rows=rows,
-                columns=columns,
-                notch_width=max(PANEL_RULES["tab"]["tab_length_mm"], 7.0),
-                layer="PANEL_OUTLINE",
-            )
+            board_x = panel_x0 + rail_left + col * pitch_x
+            board_y = panel_y0 + rail_bottom + row * pitch_y
+            add_lwpolyline_rect(msp, board_x, board_y, board_w, board_h, "PANEL_OUTLINE")
 
     # Router / Tab 或 V-cut
     # -----------------------------------------------------
@@ -1965,12 +1923,12 @@ def create_real_panel_dxf_from_source(
     # -----------------------------------------------------
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
-            x = board_area_x0 + col * board_w + (col - 0.5) * gap_x
-            add_line(msp, x, board_area_y0, x, board_area_y0 + rows * board_h + max(rows - 1, 0) * gap_y, "PANEL_VCUT")
+            x = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
+            add_line(msp, x, panel_y0 + rail_bottom, x, panel_y0 + panel_h - rail_top, "PANEL_VCUT")
 
         for row in range(1, rows):
-            y = board_area_y0 + row * board_h + (row - 0.5) * gap_y
-            add_line(msp, board_area_x0, y, board_area_x0 + columns * board_w + max(columns - 1, 0) * gap_x, y, "PANEL_VCUT")
+            y = panel_y0 + rail_bottom + row * board_h + (row - 0.5) * gap_y
+            add_line(msp, panel_x0 + rail_left, y, panel_x0 + panel_w - rail_right, y, "PANEL_VCUT")
     else:
         router_gap = max(gap_x, PANEL_RULES["cutting"]["router_min_gap_mm"])
         route_width = max(router_gap, 2.0)
@@ -1980,20 +1938,20 @@ def create_real_panel_dxf_from_source(
 
         # 垂直板間 Router channel
         for col in range(1, columns):
-            x_center = board_area_x0 + col * board_w + (col - 0.5) * gap_x
+            x_center = panel_x0 + rail_left + col * board_w + (col - 0.5) * gap_x
             x_route = x_center - route_width / 2.0
 
             add_lwpolyline_rect(
                 msp,
                 x_route,
-                board_area_y0,
+                panel_y0 + rail_bottom,
                 route_width,
-                rows * board_h + max(rows - 1, 0) * gap_y,
+                panel_h - rail_top - rail_bottom,
                 "PANEL_ROUTE",
             )
 
             for row in range(rows):
-                board_y = board_area_y0 + row * pitch_y
+                board_y = panel_y0 + rail_bottom + row * pitch_y
 
                 tab_y_1 = board_y + board_h * 0.30
                 tab_y_2 = board_y + board_h * 0.70
@@ -2018,20 +1976,20 @@ def create_real_panel_dxf_from_source(
 
         # 水平板間 Router channel
         for row in range(1, rows):
-            y_center = board_area_y0 + row * board_h + (row - 0.5) * gap_y
+            y_center = panel_y0 + rail_bottom + row * board_h + (row - 0.5) * gap_y
             y_route = y_center - route_width / 2.0
 
             add_lwpolyline_rect(
                 msp,
-                board_area_x0,
+                panel_x0 + rail_left,
                 y_route,
-                columns * board_w + max(columns - 1, 0) * gap_x,
+                panel_w - rail_left - rail_right,
                 route_width,
                 "PANEL_ROUTE",
             )
 
             for col in range(columns):
-                board_x = board_area_x0 + col * pitch_x
+                board_x = panel_x0 + rail_left + col * pitch_x
 
                 tab_x_1 = board_x + board_w * 0.30
                 tab_x_2 = board_x + board_w * 0.70
@@ -2062,10 +2020,6 @@ def create_real_panel_dxf_from_source(
             panel_y0=panel_y0,
             rail_left=rail_left,
             rail_bottom=rail_bottom,
-            edge_gap_left=edge_gap_left,
-            edge_gap_bottom=edge_gap_bottom,
-            edge_gap_right=edge_gap_right,
-            edge_gap_top=edge_gap_top,
             board_w=board_w,
             board_h=board_h,
             pitch_x=pitch_x,
@@ -2074,7 +2028,7 @@ def create_real_panel_dxf_from_source(
             rows=rows,
             tab_length=tab_length,
             tab_width=tab_width,
-            layer="PANEL_EDGE_PROFILE",
+            layer="PANEL_TAB",
         )
 
     # Tooling Hole / Fiducial
@@ -2154,12 +2108,12 @@ def create_real_panel_dxf_from_source(
     dim_left_x_2 = dim_left_x - 7.0
 
     add_dimension_line(msp, panel_x0, dim_top_y, panel_x0 + panel_w, dim_top_y, f"{panel_w:.2f}", panel_x0 + panel_w / 2.0, dim_top_y + 1.5, "PANEL_DIMENSION")
-    add_dimension_line(msp, board_area_x0, dim_top_y_2, board_area_x0 + board_w, dim_top_y_2, f"{board_w:.2f}", board_area_x0 + board_w / 2.0, dim_top_y_2 + 1.5, "PANEL_DIMENSION")
+    add_dimension_line(msp, panel_x0 + rail_left, dim_top_y_2, panel_x0 + rail_left + board_w, dim_top_y_2, f"{board_w:.2f}", panel_x0 + rail_left + board_w / 2.0, dim_top_y_2 + 1.5, "PANEL_DIMENSION")
     effective_w = columns * board_w + max(columns - 1, 0) * gap_x
-    add_dimension_line(msp, board_area_x0, dim_top_y_3, board_area_x0 + effective_w, dim_top_y_3, f"{effective_w:.2f}", board_area_x0 + effective_w / 2.0, dim_top_y_3 + 1.5, "PANEL_DIMENSION")
+    add_dimension_line(msp, panel_x0 + rail_left, dim_top_y_3, panel_x0 + rail_left + effective_w, dim_top_y_3, f"{effective_w:.2f}", panel_x0 + rail_left + effective_w / 2.0, dim_top_y_3 + 1.5, "PANEL_DIMENSION")
 
     add_dimension_line(msp, dim_left_x, panel_y0, dim_left_x, panel_y0 + panel_h, f"{panel_h:.2f}", dim_left_x - 9.0, panel_y0 + panel_h / 2.0, "PANEL_DIMENSION")
-    add_dimension_line(msp, dim_left_x_2, board_area_y0, dim_left_x_2, panel_y0 + rail_bottom + board_h, f"{board_h:.2f}", dim_left_x_2 - 10.0, board_area_y0 + board_h / 2.0, "PANEL_DIMENSION")
+    add_dimension_line(msp, dim_left_x_2, panel_y0 + rail_bottom, dim_left_x_2, panel_y0 + rail_bottom + board_h, f"{board_h:.2f}", dim_left_x_2 - 10.0, panel_y0 + rail_bottom + board_h / 2.0, "PANEL_DIMENSION")
 
     # 工藝邊尺寸引線
     if rail_left > 0:
@@ -2212,7 +2166,6 @@ def create_real_panel_dxf_from_source(
     add_text(msp, f"Panel size: {panel_w:.2f} x {panel_h:.2f} mm", info_x, info_y + 17.0, 1.7, "PANEL_TEXT")
     add_text(msp, f"{pcs_per_panel} pcs/panel, Layout: {columns} x {rows}, Split: {split_method}", info_x, info_y + 12.5, 1.7, "PANEL_TEXT")
     add_text(msp, f"Rail: {rail_policy}, L/R/T/B={rail_left:.2f}/{rail_right:.2f}/{rail_top:.2f}/{rail_bottom:.2f}", info_x, info_y + 8.0, 1.7, "PANEL_TEXT")
-    add_text(msp, f"Edge gap to PCB body: L/R/T/B={edge_gap_left:.2f}/{edge_gap_right:.2f}/{edge_gap_top:.2f}/{edge_gap_bottom:.2f} mm", info_x, info_y + 5.8, 1.5, "PANEL_TEXT")
     add_text(msp, f"Fiducial: {len(shifted_fiducials)} pcs, Tooling Hole: {len(shifted_tooling_holes)} pcs", info_x, info_y + 3.5, 1.7, "PANEL_TEXT")
     add_text(msp, f"Strategy used: True, Source: {strategy_source}", info_x, info_y - 1.0, 1.7, "PANEL_TEXT")
 
@@ -2232,20 +2185,14 @@ def create_real_panel_dxf_from_source(
         "rail_right_mm": rail_right,
         "rail_top_mm": rail_top,
         "rail_bottom_mm": rail_bottom,
-        "edge_gap_left_mm": edge_gap_left,
-        "edge_gap_right_mm": edge_gap_right,
-        "edge_gap_top_mm": edge_gap_top,
-        "edge_gap_bottom_mm": edge_gap_bottom,
-        "edge_gap_rule": "板邊與 PCB 主體四邊間距至少 2.0 mm 以上",
         "rail_policy": rail_policy,
         "split_method": split_method,
         "panel_features": shifted_feature_result,
-        "template_style": "ME_panel_drawing_template_v6_edge_notch_profile",
+        "template_style": "ME_panel_drawing_template_v4_detail_edge_routertab",
         "template_notes": {
             "white_line_planning": True,
-            "edge_gap_rule": "板邊與 PCB 主體四邊間距至少 2.0 mm 以上",
             "rail_policy": rail_policy,
-            "edge_tabs": "board-to-board tabs keep v0.9.1 logic; outer PCB edge side uses white inward U-shaped ROUTE notch profile; PCB outline is segmented at tab openings; route gap minimum is 2 mm",
+            "edge_tabs": "board-to-board tabs keep v0.9.1 logic; board-to-rail outer edge tabs are added with white lines",
             "route_gap_rule": "ROUTE 各連板間距至少 2.0 mm 以上",
             "leader_dimensions": "dimension leaders and callouts are added for tooling hole, fiducial, tab, rail and panel size",
             "tooling_hole_callout": tooling_callout,
@@ -2284,13 +2231,8 @@ def create_simple_panel_dxf_fallback(
     rail_top = float(candidate.get("rail_top_mm", rail_width))
     rail_bottom = float(candidate.get("rail_bottom_mm", rail_width))
 
-    edge_gap_left = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_right = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_top = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-    edge_gap_bottom = PANEL_RULES["tab"]["edge_to_board_gap_min_mm"]
-
-    panel_w = rail_left + edge_gap_left + rail_right + edge_gap_right + single_board_length * columns + gap_x * max(columns - 1, 0)
-    panel_h = rail_top + edge_gap_top + rail_bottom + edge_gap_bottom + single_board_width * rows + gap_y * max(rows - 1, 0)
+    panel_w = rail_left + rail_right + single_board_length * columns + gap_x * max(columns - 1, 0)
+    panel_h = rail_top + rail_bottom + single_board_width * rows + gap_y * max(rows - 1, 0)
     pitch_x = single_board_length + gap_x
     pitch_y = single_board_width + gap_y
 
@@ -2298,8 +2240,8 @@ def create_simple_panel_dxf_fallback(
 
     for row in range(rows):
         for col in range(columns):
-            x = rail_left + edge_gap_left + col * pitch_x
-            y = rail_bottom + edge_gap_bottom + row * pitch_y
+            x = rail_left + col * pitch_x
+            y = rail_bottom + row * pitch_y
             add_lwpolyline_rect(msp, x, y, single_board_length, single_board_width, "PANEL_OUTLINE")
 
     split_method = candidate.get("split_method", "V-cut")
@@ -2315,25 +2257,25 @@ def create_simple_panel_dxf_fallback(
 
     if "V-cut" in split_method or "V-CUT" in split_method:
         for col in range(1, columns):
-            x = rail_left + edge_gap_left + col * single_board_length + (col - 0.5) * gap_x
-            add_line(msp, x, rail_bottom + edge_gap_bottom, x, panel_h - rail_top - edge_gap_top, "PANEL_VCUT")
+            x = rail_left + col * single_board_length + (col - 0.5) * gap_x
+            add_line(msp, x, rail_bottom, x, panel_h - rail_top, "PANEL_VCUT")
         for row in range(1, rows):
-            y = rail_bottom + edge_gap_bottom + row * single_board_width + (row - 0.5) * gap_y
-            add_line(msp, rail_left + edge_gap_left, y, panel_w - rail_right - edge_gap_right, y, "PANEL_VCUT")
+            y = rail_bottom + row * single_board_width + (row - 0.5) * gap_y
+            add_line(msp, rail_left, y, panel_w - rail_right, y, "PANEL_VCUT")
     else:
         for col in range(1, columns):
-            x1 = rail_left + edge_gap_left + col * single_board_length + (col - 1) * gap_x
-            add_lwpolyline_rect(msp, x1, rail_bottom + edge_gap_bottom, max(gap_x, 0.3), panel_h - rail_top - rail_bottom - edge_gap_top - edge_gap_bottom, "PANEL_ROUTE")
+            x1 = rail_left + col * single_board_length + (col - 1) * gap_x
+            add_lwpolyline_rect(msp, x1, rail_bottom, max(gap_x, 0.3), panel_h - rail_top - rail_bottom, "PANEL_ROUTE")
         for row in range(1, rows):
-            y1 = rail_bottom + edge_gap_bottom + row * single_board_width + (row - 1) * gap_y
-            add_lwpolyline_rect(msp, rail_left + edge_gap_left, y1, panel_w - rail_left - rail_right - edge_gap_left - edge_gap_right, max(gap_y, 0.3), "PANEL_ROUTE")
+            y1 = rail_bottom + row * single_board_width + (row - 1) * gap_y
+            add_lwpolyline_rect(msp, rail_left, y1, panel_w - rail_left - rail_right, max(gap_y, 0.3), "PANEL_ROUTE")
 
     draw_edge_tabs(
         msp=msp,
         panel_x0=0,
         panel_y0=0,
-        rail_left=rail_left + edge_gap_left,
-        rail_bottom=rail_bottom + edge_gap_bottom,
+        rail_left=rail_left,
+        rail_bottom=rail_bottom,
         board_w=single_board_length,
         board_h=single_board_width,
         pitch_x=pitch_x,
@@ -2790,7 +2732,7 @@ def download_from_minio(object_key: str):
 
 def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
     JOB_STORE[job_id]["status"] = "running"
-    JOB_STORE[job_id]["message"] = "依公司連板規範產生 ME 模板板邊連接點連版 DXF 並執行 Dify Workflow..."
+    JOB_STORE[job_id]["message"] = "依公司連板規範產生 ME 模板連版 DXF 並執行 Dify Workflow..."
     JOB_STORE[job_id]["started_at"] = datetime.utcnow().isoformat()
 
     try:
@@ -2823,7 +2765,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "本地公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "本地公司規範 ME 模板連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2880,7 +2822,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 失敗，但公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 失敗，但公司規範 ME 模板連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2915,7 +2857,7 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
                 },
             }
             JOB_STORE[job_id]["status"] = "success"
-            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但公司規範 ME 模板板邊連接點連版 DXF 已成功產生"
+            JOB_STORE[job_id]["message"] = "Dify 回傳非 JSON，但公司規範 ME 模板連版 DXF 已成功產生"
             JOB_STORE[job_id]["result"] = fallback_result
             JOB_STORE[job_id]["error"] = None
             JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
@@ -2932,14 +2874,14 @@ def run_dify_job_background(job_id: str, inputs: Dict[str, str]):
             result_json["data"]["original_dify_status"] = "failed"
 
         JOB_STORE[job_id]["status"] = "success"
-        JOB_STORE[job_id]["message"] = "公司規範 ME 模板板邊連接點連版 DXF 已完成，Dify 結果已合併"
+        JOB_STORE[job_id]["message"] = "公司規範 ME 模板連版 DXF 已完成，Dify 結果已合併"
         JOB_STORE[job_id]["result"] = result_json
         JOB_STORE[job_id]["error"] = None
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
     except Exception as e:
         JOB_STORE[job_id]["status"] = "failed"
-        JOB_STORE[job_id]["message"] = "公司規範 ME 模板板邊連接點連版 DXF 產生失敗"
+        JOB_STORE[job_id]["message"] = "公司規範 ME 模板連版 DXF 產生失敗"
         JOB_STORE[job_id]["error"] = {"error_type": type(e).__name__, "error_detail": str(e), "traceback": traceback.format_exc()}
         JOB_STORE[job_id]["finished_at"] = datetime.utcnow().isoformat()
 
